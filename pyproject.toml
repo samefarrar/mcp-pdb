@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "samefarrar", email = "67292186+samefarrar@users.noreply.github.com" },
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = ["mcp[cli]>=1.6.0"]
 license = { text = "MIT" }
 classifiers = [
