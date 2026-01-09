@@ -18,6 +18,12 @@ classifiers = [
 [project.scripts]
 mcp-pdb = "mcp_pdb:main"
 
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
