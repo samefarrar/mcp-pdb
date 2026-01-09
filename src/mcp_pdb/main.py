@@ -155,7 +155,13 @@ def find_project_root(start_path):
 
 
 def find_venv_details(project_root):
-    """Check for virtual environment directories and return python path and bin dir."""
+    """Check for virtual environment directories and return python path and bin dir.
+
+    Note: We prioritize scanning for venv directories in the project root over
+    environment variables (VIRTUAL_ENV, CONDA_PREFIX) because when mcp-pdb runs
+    under uv or other tools, these environment variables point to mcp-pdb's own
+    environment, not the debuggee's environment.
+    """
     common_venv_names = ['.venv', 'venv', 'env', '.env', 'virtualenv', '.virtualenv']
     common_venv_locations = [project_root]
 
@@ -164,35 +170,9 @@ def find_venv_details(project_root):
     if parent_dir != project_root:  # Avoid infinite loop at filesystem root
         common_venv_locations.append(parent_dir)
 
-    # First check for environment variables pointing to active virtual env
-    if 'VIRTUAL_ENV' in os.environ:
-        venv_path = os.environ['VIRTUAL_ENV']
-        if os.path.isdir(venv_path):
-            if sys.platform == "win32":
-                python_exe = os.path.join(venv_path, 'Scripts', 'python.exe')
-                bin_dir = os.path.join(venv_path, 'Scripts')
-            else:
-                python_exe = os.path.join(venv_path, 'bin', 'python')
-                bin_dir = os.path.join(venv_path, 'bin')
-
-            if os.path.exists(python_exe):
-                print(f"Found active virtual environment: {venv_path}")
-                return python_exe, bin_dir
-
-    # Check for conda environment
-    if 'CONDA_PREFIX' in os.environ:
-        conda_path = os.environ['CONDA_PREFIX']
-        if sys.platform == "win32":
-            python_exe = os.path.join(conda_path, 'python.exe')
-            bin_dir = conda_path
-        else:
-            python_exe = os.path.join(conda_path, 'bin', 'python')
-            bin_dir = os.path.join(conda_path, 'bin')
-
-        if os.path.exists(python_exe):
-            print(f"Found conda environment: {conda_path}")
-            return python_exe, bin_dir
-
+    # First, scan for venv directories in the project root and parent
+    # This takes priority over environment variables because VIRTUAL_ENV/CONDA_PREFIX
+    # may point to mcp-pdb's own environment when running under uv
     for location in common_venv_locations:
         for name in common_venv_names:
             venv_path = os.path.join(location, name)
@@ -207,6 +187,37 @@ def find_venv_details(project_root):
                 if os.path.exists(python_exe):
                     print(f"Found virtual environment: {venv_path}")
                     return python_exe, bin_dir
+
+    # Fallback: Check environment variables pointing to active virtual env
+    # Note: These are checked AFTER scanning for project venv directories because
+    # when running under uv, these may point to mcp-pdb's own environment
+    if 'VIRTUAL_ENV' in os.environ:
+        venv_path = os.environ['VIRTUAL_ENV']
+        if os.path.isdir(venv_path):
+            if sys.platform == "win32":
+                python_exe = os.path.join(venv_path, 'Scripts', 'python.exe')
+                bin_dir = os.path.join(venv_path, 'Scripts')
+            else:
+                python_exe = os.path.join(venv_path, 'bin', 'python')
+                bin_dir = os.path.join(venv_path, 'bin')
+
+            if os.path.exists(python_exe):
+                print(f"Found active virtual environment from VIRTUAL_ENV: {venv_path}")
+                return python_exe, bin_dir
+
+    # Check for conda environment (also as fallback)
+    if 'CONDA_PREFIX' in os.environ:
+        conda_path = os.environ['CONDA_PREFIX']
+        if sys.platform == "win32":
+            python_exe = os.path.join(conda_path, 'python.exe')
+            bin_dir = conda_path
+        else:
+            python_exe = os.path.join(conda_path, 'bin', 'python')
+            bin_dir = os.path.join(conda_path, 'bin')
+
+        if os.path.exists(python_exe):
+            print(f"Found conda environment from CONDA_PREFIX: {conda_path}")
+            return python_exe, bin_dir
 
     # Look for other common Python installations
     if sys.platform == "win32":
