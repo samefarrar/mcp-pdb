@@ -1305,8 +1305,8 @@ def end_debug() -> str:
 
 def cleanup():
     """Ensure the PDB process / remote socket is closed when the MCP server exits."""
-    print("Running atexit cleanup...")
     if pdb_running or (pdb_process and pdb_process.poll() is None) or remote_socket is not None:
+        print("Running atexit cleanup...")
         end_debug()
 
 atexit.register(cleanup)
