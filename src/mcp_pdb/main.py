@@ -5,6 +5,8 @@ import re
 import shlex
 import shutil
 import signal
+import select
+import socket as socket_module
 import subprocess
 import sys
 import threading
@@ -27,6 +29,13 @@ current_use_pytest = False    # Flag indicating if pytest was used
 breakpoints = {}              # Tracks breakpoints: {abs_file_path: {line_num: {command_str, bp_number}}}
 output_thread = None          # Thread object for reading output
 
+# Remote PDB session state
+remote_socket = None          # Connected socket for remote PDB
+remote_socket_file = None     # Binary file wrapper used by the reader thread
+remote_mode = False           # True when connected to a remote PDB session
+remote_host = ""              # Remote hostname/IP
+remote_port = 0               # Remote TCP port
+
 # --- Helper Functions ---
 
 def read_pdb_output(process, output_queue):
@@ -41,7 +50,6 @@ def read_pdb_output(process, output_queue):
         print("PDB output reader: ValueError (stdout likely closed).", file=sys.stderr)
     except Exception as e:
         print(f"PDB output reader: Unexpected error: {e}", file=sys.stderr)
-        # Optionally log traceback here if needed
     finally:
         # Ensure stdout is closed if loop finishes normally or breaks
         if process and process.stdout and not process.stdout.closed:
@@ -50,6 +58,50 @@ def read_pdb_output(process, output_queue):
              except Exception as e:
                  print(f"PDB output reader: Error closing stdout: {e}", file=sys.stderr)
         print("PDB output reader thread finished.", file=sys.stderr)
+
+
+def read_socket_output(sock: socket_module.socket, output_queue: queue.Queue) -> None:
+    """Read output from a remote PDB socket and put it in the queue.
+
+    Uses recv() + select() instead of readline() so that the (Pdb) prompt
+    — which has no trailing newline — is emitted without blocking.
+
+    After draining all newline-terminated lines from a recv() chunk, a
+    select() with a short timeout checks whether more data is arriving
+    immediately.  If not, whatever remains in the buffer (typically
+    the bare '(Pdb) ' prompt) is emitted as-is.
+    """
+    buf = b""
+    try:
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except OSError as e:
+                print(f"Remote PDB reader: recv error: {e}", file=sys.stderr)
+                break
+            if not chunk:
+                break
+            buf += chunk
+
+            # Emit all newline-terminated lines
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                output_queue.put(line.decode("utf-8", errors="replace").rstrip())
+
+            # If residual bytes remain (no \n), check whether more data is
+            # arriving within 50 ms.  If not, emit them now — they are almost
+            # certainly the '(Pdb) ' prompt.
+            if buf:
+                r, _, _ = select.select([sock], [], [], 0.05)
+                if not r:
+                    output_queue.put(buf.decode("utf-8", errors="replace").rstrip())
+                    buf = b""
+    except Exception as e:
+        print(f"Remote PDB reader: unexpected error: {e}", file=sys.stderr)
+    finally:
+        if buf:
+            output_queue.put(buf.decode("utf-8", errors="replace").rstrip())
+        print("Remote PDB output reader thread finished.", file=sys.stderr)
 
 
 def get_pdb_output(timeout=0.5):
@@ -74,64 +126,109 @@ def get_pdb_output(timeout=0.5):
     return '\n'.join(output)
 
 
+def _is_local_process_alive():
+    """Return True if the local PDB subprocess is still running."""
+    return pdb_process is not None and pdb_process.poll() is None
+
+
+def _is_remote_connected():
+    """Return True if the remote socket is still open."""
+    return remote_socket is not None
+
+
 def send_to_pdb(command, timeout_multiplier=1.0):
-    """Send a command to the pdb process and get its response.
+    """Send a command to the pdb process (local or remote) and get its response.
+
+    Works for both:
+    - Local sessions (subprocess stdin/stdout)
+    - Remote sessions (TCP socket)
 
     Args:
         command: The PDB command to send
         timeout_multiplier: Multiplier to adjust timeout for complex commands
     """
-    global pdb_process, pdb_running
+    global pdb_process, pdb_running, remote_socket, remote_mode
 
-    if pdb_process and pdb_process.poll() is None:
-        # Clear queue before sending command to get only relevant output
-        while not pdb_output_queue.empty():
-            try: pdb_output_queue.get_nowait()
-            except queue.Empty: break
+    # Resolve and type-narrow the active transport before any I/O.
+    # Using local variables lets Pyright track non-None invariants.
+    if remote_mode:
+        if remote_socket is None:
+            if pdb_running:
+                pdb_running = False
+                final_output = get_pdb_output(timeout=0.1)
+                return f"No active remote pdb connection.\nFinal Output:\n{final_output}"
+            return "No active remote pdb connection."
+        pass  # remote_socket is non-None; accessed via assert below
+    else:
+        if pdb_process is None or pdb_process.poll() is not None:
+            if pdb_running:
+                pdb_running = False
+                final_output = get_pdb_output(timeout=0.1)
+                return f"No active pdb process (it terminated).\nFinal Output:\n{final_output}"
+            return "No active pdb process."
+        # pdb_process is non-None; accessed via assert below
 
-        try:
-            # Determine appropriate timeout based on command type
-            base_timeout = 1.5
-            if command.strip().lower() in ('c', 'continue', 'r', 'run', 'until', 'unt'):
-                timeout = base_timeout * 3 * timeout_multiplier
-            else:
-                timeout = base_timeout * timeout_multiplier
+    # Clear queue before sending command to get only relevant output
+    while not pdb_output_queue.empty():
+        try: pdb_output_queue.get_nowait()
+        except queue.Empty: break
 
-            pdb_process.stdin.write((command + '\n').encode('utf-8'))
-            pdb_process.stdin.flush()
-            # Wait a bit for command processing. Adjust if needed.
-            output = get_pdb_output(timeout=timeout) # Adjusted timeout for commands
+    try:
+        # Determine appropriate timeout based on command type
+        base_timeout = 1.5
+        if command.strip().lower() in ('c', 'continue', 'r', 'run', 'until', 'unt'):
+            timeout = base_timeout * 3 * timeout_multiplier
+        else:
+            timeout = base_timeout * timeout_multiplier
 
-            # Check if process ended right after the command
-            if pdb_process.poll() is not None:
-                 pdb_running = False
-                 # Try to get any final output
-                 final_output = get_pdb_output(timeout=0.1)
-                 return f"Command output:\n{output}\n{final_output}\n\n*** The debugging session has ended. ***"
+        if remote_mode:
+            # TCP socket: sendall is synchronous, no flush needed.
+            # remote_socket is non-None: checked and returned early above.
+            assert remote_socket is not None
+            remote_socket.sendall((command + '\n').encode('utf-8'))
+        else:
+            # pdb_process is non-None: checked and returned early above.
+            assert pdb_process is not None
+            stdin = pdb_process.stdin
+            if stdin is None:
+                return "Error: PDB process stdin is not available."
+            stdin.write((command + '\n').encode('utf-8'))
+            stdin.flush()
 
-            return output
+        output = get_pdb_output(timeout=timeout)
 
-        except (OSError, BrokenPipeError) as e:
-             print(f"Error writing to PDB stdin: {e}", file=sys.stderr)
-             pdb_running = False
-             # Try to get final output
-             final_output = get_pdb_output(timeout=0.1)
-             if pdb_process:
-                 pdb_process.terminate() # Ensure process is stopped
-                 pdb_process.wait(timeout=0.5)
-             return f"Error communicating with PDB: {e}\nFinal Output:\n{final_output}\n\n*** The debugging session has likely ended. ***"
-        except Exception as e:
-            print(f"Unexpected error in send_to_pdb: {e}", file=sys.stderr)
+        # For local sessions, check if process ended after the command
+        if not remote_mode and pdb_process is not None and pdb_process.poll() is not None:
             pdb_running = False
-            return f"Unexpected error sending command: {e}"
+            final_output = get_pdb_output(timeout=0.1)
+            return (f"Command output:\n{output}\n{final_output}\n\n"
+                    "*** The debugging session has ended. ***")
 
-    elif pdb_running:
-        # Process exists but poll() is not None, means it terminated
+        return output
+
+    except (OSError, BrokenPipeError) as e:
+        print(f"Error writing to PDB: {e}", file=sys.stderr)
         pdb_running = False
         final_output = get_pdb_output(timeout=0.1)
-        return f"No active pdb process (it terminated).\nFinal Output:\n{final_output}"
-    else:
-        return "No active pdb process."
+        if not remote_mode:
+            if pdb_process:
+                pdb_process.terminate()
+                pdb_process.wait(timeout=0.5)
+        else:
+            rsock = remote_socket
+            if rsock is not None:
+                try:
+                    rsock.close()
+                except Exception:
+                    pass
+            remote_socket = None
+        return (f"Error communicating with PDB: {e}\n"
+                f"Final Output:\n{final_output}\n\n"
+                "*** The debugging session has likely ended. ***")
+    except Exception as e:
+        print(f"Unexpected error in send_to_pdb: {e}", file=sys.stderr)
+        pdb_running = False
+        return f"Unexpected error sending command: {e}"
 
 
 def find_project_root(start_path):
@@ -253,6 +350,123 @@ def sanitize_arguments(args_str):
 
 
 # --- MCP Tools ---
+
+@mcp.tool()
+def connect_remote_debug(host: str = "localhost", port: int = 4444,
+                          timeout: int = 30) -> str:
+    """Connect to a remote PDB session listening on a TCP socket.
+
+    The remote Python process must expose PDB over a network socket, for example
+    using the `remote-pdb` package:
+
+        from remote_pdb import RemotePdb
+        RemotePdb('0.0.0.0', 4444).set_trace()
+
+    Or with a custom setup:
+
+        import pdb, socket, io
+        s = socket.socket(); s.bind(('0.0.0.0', 4444)); s.listen(1)
+        conn, _ = s.accept()
+        f = conn.makefile('rwb', buffering=0)
+        pdb.Pdb(stdin=io.TextIOWrapper(f), stdout=io.TextIOWrapper(f)).set_trace()
+
+    Once connected all existing tools (send_pdb_command, set_breakpoint, etc.)
+    work exactly the same as for a local session.
+
+    Args:
+        host:    Hostname or IP address of the remote machine (default "localhost").
+        port:    TCP port the remote PDB is listening on (default 4444).
+        timeout: Seconds to wait for a successful connection, retrying on
+                 ConnectionRefused (default 30).  Set to 0 for a single attempt.
+    """
+    global pdb_running, remote_socket, remote_socket_file, remote_mode
+    global remote_host, remote_port, output_thread, pdb_output_queue
+
+    if pdb_running:
+        if remote_mode:
+            return (f"Already connected to remote PDB at {remote_host}:{remote_port}. "
+                    "Use end_debug first.")
+        else:
+            return (f"Local debugging session already running for {current_file}. "
+                    "Use end_debug first.")
+
+    # Clear the output queue
+    while not pdb_output_queue.empty():
+        try: pdb_output_queue.get_nowait()
+        except queue.Empty: break
+
+    # Attempt connection, retrying until timeout
+    deadline = time.monotonic() + max(timeout, 0)
+    last_error = None
+    sock = None
+    first_attempt = True
+
+    print(f"Connecting to remote PDB at {host}:{port} (timeout={timeout}s)...")
+    while True:
+        try:
+            sock = socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM)
+            sock.settimeout(5.0)
+            sock.connect((host, port))
+            sock.settimeout(None)  # Switch to blocking after connect
+            print(f"Connected to {host}:{port}")
+            break
+        except (ConnectionRefusedError, OSError) as e:
+            last_error = e
+            if sock:
+                try: sock.close()
+                except Exception: pass
+                sock = None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (first_attempt and timeout == 0):
+                break
+            print(f"Connection refused ({e}), retrying... ({remaining:.1f}s remaining)")
+            time.sleep(min(1.0, remaining))
+        first_attempt = False
+
+    if sock is None:
+        return (f"Failed to connect to {host}:{port} within {timeout}s. "
+                f"Last error: {last_error}")
+
+    try:
+        # Ensure previous output thread is not hanging around
+        if output_thread and output_thread.is_alive():
+            print("Warning: Previous output thread was still alive.", file=sys.stderr)
+
+        # Pass the raw socket — read_socket_output uses recv()+select()
+        # so it can emit the (Pdb) prompt that has no trailing newline.
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(sock, pdb_output_queue),
+            daemon=True,
+        )
+        t.start()
+        output_thread = t
+
+        # Wait for the initial (Pdb) prompt from the remote side
+        print("Waiting for remote PDB prompt...")
+        initial_output = get_pdb_output(timeout=5.0)
+
+        if not initial_output.strip():
+            initial_output = ("(No initial output received yet. "
+                              "The remote process may be waiting for execution to reach "
+                              "the set_trace() call, or it is already at a prompt.)")
+
+        # Commit remote state
+        remote_socket = sock
+        remote_socket_file = None  # raw socket used directly; no file wrapper
+        remote_mode = True
+        remote_host = host
+        remote_port = port
+        pdb_running = True
+
+        return (f"Connected to remote PDB at {host}:{port}\n\n"
+                f"Initial output:\n{initial_output}")
+
+    except Exception as e:
+        try: sock.close()
+        except Exception: pass
+        return f"Error setting up remote connection: {e}\n{traceback.format_exc()}"
+
 
 @mcp.tool()
 def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str:
@@ -379,6 +593,9 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
             cmd = base_cmd + [rel_file_path] + parsed_args
         elif venv_python_path:
             print(f"Using venv Python: {venv_python_path}")
+            # find_venv_details returns (python_path, bin_dir) as a pair;
+            # venv_bin_dir is non-None whenever venv_python_path is non-None.
+            assert venv_bin_dir is not None
             venv_dir = os.path.dirname(os.path.dirname(venv_bin_dir)) # Get actual venv root
             env['VIRTUAL_ENV'] = venv_dir
             env['PATH'] = f"{venv_bin_dir}{os.pathsep}{env.get('PATH', '')}"
@@ -532,7 +749,7 @@ def start_debug(file_path: str, use_pytest: bool = False, args: str = "") -> str
 
     except FileNotFoundError as e:
          pdb_running = False
-         return f"Error starting debugging session: Command not found ({e.filename}). Is '{cmd[0]}' installed and in the correct PATH (system or venv)?\n{traceback.format_exc()}"
+         return f"Error starting debugging session: Command not found ({e.filename}). Check that the required executable is installed and in PATH (system or venv).\n{traceback.format_exc()}"
     except Exception as e:
         pdb_running = False
         return f"Error starting debugging session: {str(e)}\n{traceback.format_exc()}"
@@ -553,16 +770,21 @@ def send_pdb_command(command: str) -> str:
     Args:
         command: The PDB command string.
     """
-    global pdb_running, pdb_process
+    global pdb_running, pdb_process, remote_socket, remote_mode
 
     if not pdb_running:
-        return "No active debugging session. Use start_debug first."
+        return "No active debugging session. Use start_debug or connect_remote_debug first."
 
-    # Double check process liveness
-    if pdb_process is None or pdb_process.poll() is not None:
-         pdb_running = False
-         final_output = get_pdb_output(timeout=0.1)
-         return f"The debugging session appears to have ended.\nFinal Output:\n{final_output}"
+    # Double check connection liveness
+    if remote_mode:
+        if not _is_remote_connected():
+            pdb_running = False
+            return "Remote debugging connection closed."
+    else:
+        if pdb_process is None or pdb_process.poll() is not None:
+            pdb_running = False
+            final_output = get_pdb_output(timeout=0.1)
+            return f"The debugging session appears to have ended.\nFinal Output:\n{final_output}"
 
     try:
         # Determine appropriate timeout based on command complexity
@@ -580,28 +802,30 @@ def send_pdb_command(command: str) -> str:
         # Provide extra context for common navigation commands
         # Only do this if the session is still running
         nav_commands = ['n', 's', 'c', 'r', 'unt', 'until', 'next', 'step', 'continue', 'return']
-        if command.strip().lower() in nav_commands and pdb_running and pdb_process.poll() is None:
-            # Give PDB a tiny bit more time after navigation before asking for location
-            # Check again if it's running before sending 'l .'
-            if pdb_running and pdb_process.poll() is None:
+        if command.strip().lower() in nav_commands and pdb_running:
+            still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
+            if still_active:
                 print("Fetching context after navigation...")
                 line_context = send_to_pdb("l .")
-                 # Check again after sending 'l .'
-                if pdb_running and pdb_process.poll() is None:
+                still_active2 = _is_remote_connected() if remote_mode else _is_local_process_alive()
+                if pdb_running and still_active2:
                     response += f"\n\n-- Current location --\n{line_context}"
                 else:
                     response += "\n\n-- Session ended after navigation --"
-                    pdb_running = False # Ensure state is correct
+                    pdb_running = False
 
         return f"Command output:\n{response}"
 
     except Exception as e:
         # Catch unexpected errors during command sending/processing
         print(f"Error in send_pdb_command: {e}", file=sys.stderr)
-        # Check process status again
-        if pdb_process and pdb_process.poll() is not None:
+        # Check connection status again
+        still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
+        if not still_active:
              pdb_running = False
-             return f"Error sending command: {str(e)}\n\n*** The debugging session has likely ended. ***\n{traceback.format_exc()}"
+             return (f"Error sending command: {str(e)}\n\n"
+                     "*** The debugging session has likely ended. ***\n"
+                     f"{traceback.format_exc()}")
         else:
              return f"Error sending command: {str(e)}\n{traceback.format_exc()}"
 
@@ -617,7 +841,7 @@ def set_breakpoint(file_path: str, line_number: int) -> str:
     global breakpoints, current_project_root
 
     if not pdb_running:
-        return "No active debugging session. Use start_debug first."
+        return "No active debugging session. Use start_debug or connect_remote_debug first."
     if not current_project_root:
          return "Error: Project root not identified. Cannot reliably set breakpoint."
 
@@ -683,7 +907,7 @@ def clear_breakpoint(file_path: str, line_number: int) -> str:
     global breakpoints, current_project_root
 
     if not pdb_running:
-        return "No active debugging session. Use start_debug first."
+        return "No active debugging session. Use start_debug or connect_remote_debug first."
     if not current_project_root:
          return "Error: Project root not identified. Cannot reliably clear breakpoint."
 
@@ -744,7 +968,7 @@ def list_breakpoints() -> str:
     global breakpoints, current_project_root
 
     if not pdb_running:
-        return "No active debugging session. Use start_debug first."
+        return "No active debugging session. Use start_debug or connect_remote_debug first."
     if not current_project_root:
         # List only tracked BPs if PDB isn't running or root unknown
         tracked_bps_formatted = []
@@ -790,9 +1014,29 @@ def list_breakpoints() -> str:
 
 @mcp.tool()
 def restart_debug() -> str:
-    """Restart the debugging session with the same file, arguments, and pytest flag."""
-    global pdb_process, pdb_running, current_file, current_args, current_use_pytest
+    """Restart the debugging session with the same file/connection, arguments, and pytest flag.
 
+    For remote sessions: reconnects to the same host and port.
+    For local sessions: relaunches the same file with the same arguments.
+    """
+    global pdb_process, pdb_running, current_file, current_args, current_use_pytest
+    global remote_mode, remote_host, remote_port
+
+    if remote_mode:
+        # Remote restart: close current connection and reconnect
+        stored_host = remote_host
+        stored_port = remote_port
+        if not stored_host:
+            return "No remote session was previously started to restart."
+
+        print(f"Attempting to reconnect to remote PDB at {stored_host}:{stored_port}...")
+        end_result = end_debug()
+        reconnect_result = connect_remote_debug(host=stored_host, port=stored_port)
+        return (f"--- Remote Restart Attempt ---\n"
+                f"Previous session end result: {end_result}\n\n"
+                f"Reconnection status:\n{reconnect_result}")
+
+    # Local restart
     if not current_file:
         return "No debugging session was previously started (or state lost) to restart."
 
@@ -836,7 +1080,7 @@ def examine_variable(variable_name: str) -> str:
         variable_name: Name of the variable to examine (e.g., 'my_var', 'self.data').
     """
     if not pdb_running:
-        return "No active debugging session. Use start_debug first."
+        return "No active debugging session. Use start_debug or connect_remote_debug first."
 
     # Basic print
     p_command = f"p {variable_name}"
@@ -878,17 +1122,24 @@ def examine_variable(variable_name: str) -> str:
 def get_debug_status() -> str:
     """Get the current status of the debugging session and tracked state."""
     global pdb_running, current_file, current_project_root, breakpoints, pdb_process
+    global remote_mode, remote_host, remote_port, remote_socket
 
     if not pdb_running:
-         # Check if process exists but isn't running
+         if remote_mode and remote_socket is None:
+             return "Remote debugging connection closed."
          if pdb_process and pdb_process.poll() is not None:
-              return "Debugging session ended. Process terminated."
+             return "Debugging session ended. Process terminated."
          return "No active debugging session."
 
-    # Check process liveness again
-    if pdb_process and pdb_process.poll() is not None:
-        pdb_running = False
-        return "Debugging session has ended (process terminated)."
+    # Check connection liveness
+    if remote_mode:
+        if not _is_remote_connected():
+            pdb_running = False
+            return "Remote debugging connection has been closed."
+    else:
+        if pdb_process and pdb_process.poll() is not None:
+            pdb_running = False
+            return "Debugging session has ended (process terminated)."
 
     # Format tracked breakpoints for status
     bp_list = []
@@ -905,49 +1156,87 @@ def get_debug_status() -> str:
             else:
                 bp_list.append(f"{rel_path}:{line_num}")
 
-    status = {
-        "running": pdb_running,
-        "current_file": current_file,
-        "project_root": current_project_root,
-        "use_pytest": current_use_pytest,
-        "arguments": current_args,
-        "process_id": pdb_process.pid if pdb_process else None,
-        "tracked_breakpoints": bp_list,
-    }
+    if remote_mode:
+        status_lines = [
+            "--- Debug Session Status ---",
+            f"Running: {pdb_running}",
+            f"Mode: remote",
+            f"Remote host: {remote_host}:{remote_port}",
+            f"Project Root: {current_project_root or '(not set)'}",
+            f"Tracked Breakpoints: {bp_list or 'None'}",
+        ]
+    else:
+        status_lines = [
+            "--- Debug Session Status ---",
+            f"Running: {pdb_running}",
+            f"Mode: local",
+            f"PID: {pdb_process.pid if pdb_process else None}",
+            f"Project Root: {current_project_root}",
+            f"Debugging File: {current_file}",
+            f"Using Pytest: {current_use_pytest}",
+            f"Arguments: '{current_args}'",
+            f"Tracked Breakpoints: {bp_list or 'None'}",
+        ]
 
     # Try to get current location from PDB without advancing
     current_loc_output = "[Could not query PDB location]"
-    if pdb_running and pdb_process and pdb_process.poll() is None:
-         current_loc_output = send_to_pdb("l .") # Get location without changing state
-         if not pdb_running: # Check if the query itself ended the session
-             status["running"] = False
-             current_loc_output += "\n -- Session ended during status check --"
+    still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
+    if pdb_running and still_active:
+        current_loc_output = send_to_pdb("l .")
+        if not pdb_running:
+            current_loc_output += "\n -- Session ended during status check --"
 
-
-    return "--- Debug Session Status ---\n" + \
-           f"Running: {status['running']}\n" + \
-           f"PID: {status['process_id']}\n" + \
-           f"Project Root: {status['project_root']}\n" + \
-           f"Debugging File: {status['current_file']}\n" + \
-           f"Using Pytest: {status['use_pytest']}\n" + \
-           f"Arguments: '{status['arguments']}'\n" + \
-           f"Tracked Breakpoints: {status['tracked_breakpoints'] or 'None'}\n\n" + \
-           f"-- Current PDB Location --\n{current_loc_output}\n" + \
-           "--- End Status ---"
+    status_lines.append("")
+    status_lines.append("-- Current PDB Location --")
+    status_lines.append(current_loc_output)
+    status_lines.append("--- End Status ---")
+    return '\n'.join(status_lines)
 
 
 @mcp.tool()
 def end_debug() -> str:
-    """End the current debugging session forcefully."""
-    global pdb_process, pdb_running, output_thread
+    """End the current debugging session forcefully.
 
-    if not pdb_running and (pdb_process is None or pdb_process.poll() is not None):
+    Works for both local subprocess sessions and remote TCP sessions.
+    """
+    global pdb_process, pdb_running, output_thread
+    global remote_socket, remote_socket_file, remote_mode, remote_host, remote_port
+
+    nothing_to_end = (
+        not pdb_running
+        and (pdb_process is None or pdb_process.poll() is not None)
+        and remote_socket is None
+    )
+    if nothing_to_end:
         return "No active debugging session to end."
 
     print("Ending debugging session...")
     result_message = "Debugging session ended."
 
-    if pdb_process and pdb_process.poll() is None:
+    if remote_mode:
+        # --- Remote session teardown ---
+        print(f"Closing remote PDB connection to {remote_host}:{remote_port}...")
+        if remote_socket:
+            try:
+                # Politely ask PDB to quit before closing
+                try:
+                    remote_socket.sendall(b'q\n')
+                    time.sleep(0.2)
+                except Exception:
+                    pass
+                remote_socket.close()
+                print("Remote socket closed.")
+            except Exception as e:
+                print(f"Error closing remote socket: {e}", file=sys.stderr)
+                result_message = f"Remote session ended with socket error: {e}"
+        remote_socket = None
+        remote_socket_file = None
+        remote_mode = False
+        remote_host = ""
+        remote_port = 0
+
+    elif pdb_process and pdb_process.poll() is None:
+        # --- Local process teardown ---
         try:
             # Try sending SIGINT (Ctrl+C) first for cleaner exit
             if sys.platform != "win32":
@@ -964,8 +1253,9 @@ def end_debug() -> str:
             if pdb_process.poll() is None:
                 try:
                     print("Attempting graceful exit with 'q'...")
-                    pdb_process.stdin.write(b'q\n')
-                    pdb_process.stdin.flush()
+                    if pdb_process.stdin is not None:
+                        pdb_process.stdin.write(b'q\n')
+                        pdb_process.stdin.flush()
                     # Wait briefly for potential cleanup
                     pdb_process.wait(timeout=0.5)
                     print("PDB process quit gracefully.")
@@ -990,7 +1280,7 @@ def end_debug() -> str:
             print(f"Error during end_debug: {e}", file=sys.stderr)
             result_message = f"Debugging session ended with errors: {e}"
 
-    # Clean up state
+    # Clean up shared state
     pdb_process = None
     pdb_running = False
 
@@ -1014,9 +1304,9 @@ def end_debug() -> str:
 # --- Cleanup on Exit ---
 
 def cleanup():
-    """Ensure the PDB process is terminated when the MCP server exits."""
+    """Ensure the PDB process / remote socket is closed when the MCP server exits."""
     print("Running atexit cleanup...")
-    if pdb_running or (pdb_process and pdb_process.poll() is None):
+    if pdb_running or (pdb_process and pdb_process.poll() is None) or remote_socket is not None:
         end_debug()
 
 atexit.register(cleanup)
