@@ -62,17 +62,77 @@ Connect to a Python process that exposes PDB over a TCP socket.  All existing
 tools (`send_pdb_command`, `set_breakpoint`, `examine_variable`, etc.) work
 identically once connected.
 
-### Setup on the remote side
+### rpdb — dual-session debugger (recommended)
 
-**Option A – `remote-pdb` package (recommended)**
+`rpdb` is installed alongside `mcp-pdb` and is the easiest way to debug with
+both a local terminal and the MCP agent simultaneously.
+
+```
+Terminal ──→ stdin ──→ PDB ──→ stdout ──→ Terminal
+                            └──→ socket ──→ mcp-pdb
+mcp-pdb  ──→ socket ──┘  (local stdin takes priority)
+```
+
+**Start a script under rpdb:**
+
+```bash
+REMOTE_PDB_PORT=4444 rpdb script.py [args]
+REMOTE_PDB_PORT=4444 rpdb -m mymodule [args]
+```
+
+rpdb prints `waiting for mcp connection on 127.0.0.1:4444 ...` and blocks
+until the MCP agent connects.  All normal pdb flags (`-c`, `--help`, etc.)
+are supported.
+
+**Then connect from Claude / the MCP agent:**
+
+```
+connect_remote_debug(host="127.0.0.1", port=4444)
+```
+
+All PDB output is now mirrored to both the terminal and the agent.  Commands
+typed in the terminal take priority; the agent's commands are echoed to the
+terminal so you can follow along.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REMOTE_PDB_HOST` | `127.0.0.1` | Interface to listen on (`0.0.0.0` for remote machines) |
+| `REMOTE_PDB_PORT` | `4444` | TCP port |
+
+**In-source one-liner** (correct frame, all locals visible):
 
 ```python
-# In your Python script or inside a debugger trigger:
+# Add at the line you want to break at:
+from mcp_pdb.rpdb import set_trace; set_trace()
+```
+
+The process blocks here until the MCP agent (or any TCP client) connects.
+
+**Zero-code-change with `breakpoint()`:**
+
+```bash
+PYTHONBREAKPOINT=mcp_pdb.rpdb.set_trace python script.py
+```
+
+**Python ≥ 3.11 with `--pdbcls`** (remote only, no local terminal):
+
+```bash
+python -m pdb --pdbcls=mcp_pdb.rpdb:Debugger script.py
+pytest --pdb --pdbcls=mcp_pdb.rpdb:Debugger
+```
+
+### Manual remote-pdb setup
+
+If you need to attach to an already-running process without using `rpdb`:
+
+**Option A – `remote-pdb` package**
+
+```python
 from remote_pdb import RemotePdb
 RemotePdb("0.0.0.0", 4444).set_trace()
 ```
-
-Install once: `pip install remote-pdb`
 
 **Option B – stdlib only**
 
@@ -88,7 +148,7 @@ f = conn.makefile("rwb", buffering=0)
 pdb.Pdb(stdin=io.TextIOWrapper(f), stdout=io.TextIOWrapper(f)).set_trace()
 ```
 
-### Connect from Claude / the LLM
+**Connect from Claude / the LLM:**
 
 ```
 connect_remote_debug(host="192.168.1.10", port=4444)
