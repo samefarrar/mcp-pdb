@@ -1,14 +1,23 @@
 """Tests for helper functions in mcp_pdb.main."""
 
 import os
+import queue
+import socket
 import sys
 import tempfile
+import threading
+import time  # noqa: F401 – used in test_emits_prompt_without_newline
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from mcp_pdb.main import find_project_root, find_venv_details, sanitize_arguments
+from mcp_pdb.main import (
+    find_project_root,
+    find_venv_details,
+    read_socket_output,
+    sanitize_arguments,
+)
 
 
 class TestFindProjectRoot:
@@ -338,3 +347,162 @@ class TestSanitizeArguments:
         """Should handle arguments with equals signs."""
         result = sanitize_arguments("--key=value --other=123")
         assert result == ["--key=value", "--other=123"]
+
+
+# ---------------------------------------------------------------------------
+# Remote PDB helpers
+# ---------------------------------------------------------------------------
+
+def _make_socket_pair():
+    """Return a connected (server_conn, client) socket pair for testing."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect(("127.0.0.1", port))
+
+    server_conn, _ = srv.accept()
+    srv.close()
+    return server_conn, client
+
+
+class TestReadSocketOutput:
+    """Tests for the read_socket_output helper (recv-based, raw socket)."""
+
+    def test_reads_lines_into_queue(self):
+        """Should decode newline-terminated lines and put them in the queue."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"> /tmp/test.py(1)<module>()\n")
+        server_conn.sendall(b"-> x = 1\n")
+        server_conn.sendall(b"(Pdb) \n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert "> /tmp/test.py(1)<module>()" in collected
+        assert "-> x = 1" in collected
+        assert "(Pdb)" in collected
+
+    def test_emits_prompt_without_newline(self):
+        """(Pdb) prompt (no trailing \\n) should be emitted via select timeout."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"> /tmp/test.py(1)<module>()\n")
+        server_conn.sendall(b"-> x = 1\n")
+        # Send prompt WITHOUT trailing newline — the critical case
+        server_conn.sendall(b"(Pdb) ")
+        time.sleep(0.15)  # longer than the 50 ms select timeout in the reader
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert any("(Pdb)" in line for line in collected), collected
+
+    def test_handles_unicode_in_output(self):
+        """Should handle non-ASCII characters with 'replace' error mode."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall("résultat = 42\n".encode("utf-8"))
+        server_conn.sendall(b"bad \xff byte\n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert any("sultat" in line for line in collected), collected
+        assert any("bad" in line for line in collected), collected
+
+    def test_stops_on_eof(self):
+        """Thread should exit cleanly when the socket is closed."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.close()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "Reader thread should have exited on EOF"
+
+    def test_rstrips_trailing_cr(self):
+        """Lines sent with \\r\\n endings should have the \\r stripped."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"(Pdb) \r\n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        for line in collected:
+            assert not line.endswith("\n"), repr(line)
+            assert not line.endswith("\r"), repr(line)
+
+
+class TestRemoteSessionStateIsolation:
+    """Verify that remote globals do not bleed into local session globals."""
+
+    def test_remote_globals_default_values(self):
+        """Remote-session globals should start at their documented defaults."""
+        import sys
+
+        # mcp_pdb/__init__.py shadows 'mcp_pdb.main' attribute with the
+        # main() function, so we retrieve the actual module from sys.modules
+        # (it is guaranteed to be present because other imports in this file
+        # already loaded it).
+        m = sys.modules["mcp_pdb.main"]
+
+        assert m.remote_mode is False          # type: ignore[attr-defined]
+        assert m.remote_socket is None         # type: ignore[attr-defined]
+        assert m.remote_socket_file is None    # type: ignore[attr-defined]
+        assert m.remote_host == ""             # type: ignore[attr-defined]
+        assert m.remote_port == 0              # type: ignore[attr-defined]
