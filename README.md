@@ -45,15 +45,60 @@ claude mcp add mcp-pdb -- uv run --python 3.13 --with mcp-pdb mcp-pdb
 
 | Tool | Description |
 |------|-------------|
-| `start_debug(file_path, use_pytest, args)` | Start a debugging session for a Python file |
-| `send_pdb_command(command)` | Send a command to the running PDB instance |
+| `start_debug(file_path, use_pytest, args)` | Start a local debugging session for a Python file |
+| `connect_remote_debug(host, port, timeout)` | Connect to a remote PDB session over TCP |
+| `send_pdb_command(command)` | Send a command to the running PDB instance (local or remote) |
 | `set_breakpoint(file_path, line_number)` | Set a breakpoint at a specific line |
 | `clear_breakpoint(file_path, line_number)` | Clear a breakpoint at a specific line |
 | `list_breakpoints()` | List all current breakpoints |
-| `restart_debug()` | Restart the current debugging session |
+| `restart_debug()` | Restart/reconnect the current debugging session |
 | `examine_variable(variable_name)` | Get detailed information about a variable |
 | `get_debug_status()` | Show the current state of the debugging session |
-| `end_debug()` | End the current debugging session |
+| `end_debug()` | End the current debugging session (closes socket for remote) |
+
+## Remote Debugging
+
+Connect to a Python process that exposes PDB over a TCP socket.  All existing
+tools (`send_pdb_command`, `set_breakpoint`, `examine_variable`, etc.) work
+identically once connected.
+
+### Setup on the remote side
+
+**Option A – `remote-pdb` package (recommended)**
+
+```python
+# In your Python script or inside a debugger trigger:
+from remote_pdb import RemotePdb
+RemotePdb("0.0.0.0", 4444).set_trace()
+```
+
+Install once: `pip install remote-pdb`
+
+**Option B – stdlib only**
+
+```python
+import io, socket, pdb
+
+srv = socket.socket()
+srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 4444))
+srv.listen(1)
+conn, _ = srv.accept()   # blocks until MCP connects
+f = conn.makefile("rwb", buffering=0)
+pdb.Pdb(stdin=io.TextIOWrapper(f), stdout=io.TextIOWrapper(f)).set_trace()
+```
+
+### Connect from Claude / the LLM
+
+```
+connect_remote_debug(host="192.168.1.10", port=4444)
+```
+
+`timeout` (default 30 s) controls how long to retry on `ConnectionRefused`—
+useful when the remote process has not yet reached `set_trace()`.
+
+`restart_debug()` reconnects to the same host/port.  `end_debug()` closes the
+socket gracefully (sends `q` first).
 
 ## Common PDB Commands
 
