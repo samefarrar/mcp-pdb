@@ -11,3 +11,6 @@ wheels/
 
 # Lock files (generated from pyproject.toml)
 uv.lock
+
+# Local CE review artifacts
+.context/

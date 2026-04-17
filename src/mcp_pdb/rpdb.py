@@ -22,28 +22,40 @@ Usage modes:
        python -m pdb --pdbcls=mcp_pdb.rpdb:Debugger script.py
        pytest --pdb --pdbcls=mcp_pdb.rpdb:Debugger
 
-Env vars:  REMOTE_PDB_HOST (default 127.0.0.1)  REMOTE_PDB_PORT (default 4444)
+Env vars:
+  REMOTE_PDB_HOST              default 127.0.0.1
+  REMOTE_PDB_PORT              default 4444
+  REMOTE_PDB_ACCEPT_TIMEOUT    seconds DualPdb will wait for a client to
+                               connect before giving up (default 600).
+                               Set to 0 to wait forever.
 """
 import os
 import pdb as _pdb
+import select
 import socket as _socket
 import sys
+from types import FrameType
 from typing import IO, cast
 
 from remote_pdb import RemotePdb as _RemotePdb
 
 _HOST = os.environ.get("REMOTE_PDB_HOST", "127.0.0.1")
 _PORT = int(os.environ.get("REMOTE_PDB_PORT", "4444"))
+# Bounded accept() by default so non-interactive runs (CI, nohup) do not
+# hang indefinitely when no mcp client ever connects.  Ten minutes is
+# invisible to humans and an explicit upper bound for robots.  Set to 0
+# to preserve the pre-fix "wait forever" behaviour.
+_ACCEPT_TIMEOUT = float(os.environ.get("REMOTE_PDB_ACCEPT_TIMEOUT", "600"))
 
 
-# ── modes 2 / 3 ───────────────────────────────────────────────────────────────
+# --- modes 2 / 3 -----------------------------------------------------------
 
 def set_trace(host: str = _HOST, port: int = _PORT) -> None:
     """Drop-in for pdb.set_trace(). Blocks until a client connects."""
     _RemotePdb(host, port).set_trace(frame=sys._getframe().f_back)
 
 
-# ── mode 4  (Python >= 3.11 --pdbcls, remote-only) ───────────────────────────
+# --- mode 4  (Python >= 3.11 --pdbcls, remote-only) ------------------------
 
 class Debugger(_RemotePdb):
     """Absorbs pdb.Pdb __init__ kwargs; uses REMOTE_PDB_HOST/PORT."""
@@ -51,7 +63,7 @@ class Debugger(_RemotePdb):
         _RemotePdb.__init__(self, host=_HOST, port=_PORT)
 
 
-# ── mode 1  helpers ───────────────────────────────────────────────────────────
+# --- mode 1  helpers -------------------------------------------------------
 
 class _TeeOutput:
     """Write PDB output to both local stdout and remote socket simultaneously."""
@@ -67,8 +79,20 @@ class _TeeOutput:
         if self._conn_alive:
             try:
                 self._conn.sendall(data.encode("utf-8", errors="replace"))
-            except OSError:
-                self._conn_alive = False  # stop trying after first failure
+            except OSError as e:
+                # Log once to local stderr so the user knows the remote
+                # dropped and isn't still waiting for agent interaction.
+                # The agent itself discovers the dead connection on its
+                # next send_pdb_command (sendall raises) — we deliberately
+                # do not push a sentinel into the output queue because
+                # that would create a second error-signal channel that
+                # can diverge from the first.
+                print(
+                    f"rpdb: remote client disconnected ({e}); "
+                    "continuing in local-only mode.",
+                    file=sys.__stderr__, flush=True,
+                )
+                self._conn_alive = False
 
     def flush(self) -> None:
         self._local.flush()
@@ -96,21 +120,21 @@ class _SelectStdin:
         self._local = local
         self._remote = sock_file
         self._fds: list[IO[str]] = [local, sock_file]
+        # Cache references on self so they survive pdb._runscript() clearing
+        # __main__.__dict__ when this module happens to be __main__.
+        self._select = select
+        self._sys = sys
         # Drain any bytes buffered in stdin before the debugger starts
         # (e.g. Delete / arrow-key escape sequences left over from the shell).
-        import select as _sel, os as _os
         try:
-            if _sel.select([local], [], [], 0)[0]:
-                _os.read(local.fileno(), 4096)
+            if select.select([local], [], [], 0)[0]:
+                os.read(local.fileno(), 4096)
         except Exception:
             pass
 
     def readline(self) -> str:
-        # pdb._runscript() clears __main__.__dict__ before starting the
-        # debuggee.  Re-import here so names are always available regardless
-        # of whether this module is __main__ or an installed package.
-        import select as _sel
-        import sys as _sys
+        _sel = self._select
+        _sys = self._sys
 
         while self._fds:
             try:
@@ -158,7 +182,7 @@ class _SelectStdin:
         return getattr(self._local, "encoding", "utf-8")
 
 
-# ── mode 1  DualPdb ───────────────────────────────────────────────────────────
+# --- mode 1  DualPdb -------------------------------------------------------
 
 class DualPdb(_pdb.Pdb):
     """PDB that serves both the local terminal and a remote mcp-pdb client.
@@ -175,13 +199,35 @@ class DualPdb(_pdb.Pdb):
 
     def __init__(self, host: str = _HOST, port: int = _PORT, **_: object) -> None:
         srv = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-        srv.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, True)
-        srv.bind((host, port))
-        print(f"rpdb: waiting for mcp connection on {host}:{port} ...",
-              file=sys.__stderr__, flush=True)
-        srv.listen(1)
-        self._conn, addr = srv.accept()
-        srv.close()
+        # No SO_REUSEADDR: a fresh bind on every invocation removes the
+        # local-user race for accept() on shared dev hosts.
+        try:
+            srv.bind((host, port))
+            # Bounded accept() unless the user explicitly asked for
+            # wait-forever via REMOTE_PDB_ACCEPT_TIMEOUT=0.
+            if _ACCEPT_TIMEOUT > 0:
+                srv.settimeout(_ACCEPT_TIMEOUT)
+                wait_msg = (
+                    f"rpdb: waiting up to {_ACCEPT_TIMEOUT:.0f}s for mcp "
+                    f"connection on {host}:{port} ..."
+                )
+            else:
+                wait_msg = f"rpdb: waiting for mcp connection on {host}:{port} ..."
+            print(wait_msg, file=sys.__stderr__, flush=True)
+            srv.listen(1)
+            try:
+                self._conn, addr = srv.accept()
+            except _socket.timeout as e:
+                raise SystemExit(
+                    f"rpdb: no mcp client connected within "
+                    f"{_ACCEPT_TIMEOUT:.0f}s. Set "
+                    f"REMOTE_PDB_ACCEPT_TIMEOUT=0 to wait forever, or a "
+                    f"larger value for a longer wait."
+                ) from e
+            # accept() inherits srv's timeout; reset the conn to blocking.
+            self._conn.settimeout(None)
+        finally:
+            srv.close()
         print(f"rpdb: mcp connected from {addr}", file=sys.__stderr__, flush=True)
 
         self._sock_file: IO[str] = self._conn.makefile("r")
@@ -196,7 +242,7 @@ class DualPdb(_pdb.Pdb):
             stdout=cast(IO[str], _TeeOutput(local_out, self._conn)),
         )
 
-    def set_trace(self, frame=None):  # type: ignore[override]
+    def set_trace(self, frame: FrameType | None = None) -> None:  # type: ignore[override]
         if frame is None:
             frame = sys._getframe().f_back
         # Use super() rather than _pdb.Pdb to avoid a NameError if
@@ -207,18 +253,18 @@ class DualPdb(_pdb.Pdb):
         """Close the remote socket before handing off to pdb's quit handler."""
         try:
             self._sock_file.close()
-        except Exception:
+        except OSError:
             pass
         try:
             self._conn.close()
-        except Exception:
+        except OSError:
             pass
         return super().do_quit(arg)
 
     do_q = do_exit = do_quit  # type: ignore[assignment]
 
 
-# ── entry point ───────────────────────────────────────────────────────────────
+# --- entry point -----------------------------------------------------------
 
 _HELP = """\
 usage: rpdb [-c command] ... [-m module | pyfile] [arg] ...
