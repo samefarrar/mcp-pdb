@@ -7,7 +7,7 @@ authors = [
     { name = "samefarrar", email = "67292186+samefarrar@users.noreply.github.com" },
 ]
 requires-python = ">=3.10"
-dependencies = ["mcp[cli]>=1.6.0"]
+dependencies = ["mcp[cli]>=1.6.0", "remote-pdb>=2.1.0"]
 license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -17,6 +17,7 @@ classifiers = [
 
 [project.scripts]
 mcp-pdb = "mcp_pdb:main"
+rpdb = "mcp_pdb.rpdb:main"
 
 [dependency-groups]
 dev = ["pytest>=8.0.0"]

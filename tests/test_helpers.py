@@ -1,14 +1,24 @@
 """Tests for helper functions in mcp_pdb.main."""
 
 import os
+import queue
+import socket
 import sys
 import tempfile
+import threading
+import time  # noqa: F401 – used in test_emits_prompt_without_newline
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from mcp_pdb.main import find_project_root, find_venv_details, sanitize_arguments
+from mcp_pdb.main import (
+    find_project_root,
+    find_venv_details,
+    get_pdb_output,
+    read_socket_output,
+    sanitize_arguments,
+)
 
 
 class TestFindProjectRoot:
@@ -338,3 +348,238 @@ class TestSanitizeArguments:
         """Should handle arguments with equals signs."""
         result = sanitize_arguments("--key=value --other=123")
         assert result == ["--key=value", "--other=123"]
+
+
+# ---------------------------------------------------------------------------
+# Remote PDB helpers
+# ---------------------------------------------------------------------------
+
+def _make_socket_pair() -> tuple[socket.socket, socket.socket]:
+    """Return a connected (server_conn, client) socket pair for testing."""
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect(("127.0.0.1", port))
+
+    server_conn, _ = srv.accept()
+    srv.close()
+    return server_conn, client
+
+
+class TestReadSocketOutput:
+    """Tests for the read_socket_output helper (recv-based, raw socket)."""
+
+    def test_reads_lines_into_queue(self):
+        """Should decode newline-terminated lines and put them in the queue."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"> /tmp/test.py(1)<module>()\n")
+        server_conn.sendall(b"-> x = 1\n")
+        server_conn.sendall(b"(Pdb) \n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert "> /tmp/test.py(1)<module>()" in collected
+        assert "-> x = 1" in collected
+        # rstrip('\r') preserves the trailing space in '(Pdb) '
+        assert any(line.startswith("(Pdb)") for line in collected), collected
+
+    def test_emits_prompt_without_newline(self):
+        """(Pdb) prompt (no trailing \\n) should be emitted via select timeout."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"> /tmp/test.py(1)<module>()\n")
+        server_conn.sendall(b"-> x = 1\n")
+        # Send prompt WITHOUT trailing newline — the critical case
+        server_conn.sendall(b"(Pdb) ")
+        time.sleep(0.15)  # longer than the 50 ms select timeout in the reader
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert any("(Pdb)" in line for line in collected), collected
+
+    def test_handles_unicode_in_output(self):
+        """Should handle non-ASCII characters with 'replace' error mode."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall("résultat = 42\n".encode("utf-8"))
+        server_conn.sendall(b"bad \xff byte\n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        assert any("sultat" in line for line in collected), collected
+        assert any("bad" in line for line in collected), collected
+
+    def test_stops_on_eof(self):
+        """Thread should exit cleanly when the socket is closed."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.close()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "Reader thread should have exited on EOF"
+
+    def test_rstrips_trailing_cr(self):
+        """Lines sent with \\r\\n endings should have the \\r stripped."""
+        server_conn, client = _make_socket_pair()
+        out_q = queue.Queue()
+
+        t = threading.Thread(
+            target=read_socket_output,
+            args=(client, out_q),
+            daemon=True,
+        )
+        t.start()
+
+        server_conn.sendall(b"(Pdb) \r\n")
+        server_conn.close()
+
+        t.join(timeout=2.0)
+        collected = []
+        while not out_q.empty():
+            collected.append(out_q.get_nowait())
+
+        for line in collected:
+            assert not line.endswith("\n"), repr(line)
+            assert not line.endswith("\r"), repr(line)
+
+
+@pytest.fixture
+def caveman_toggle():
+    """Yield a callable that sets caveman_mode on the real main module.
+
+    Restores the original value on teardown and drains the shared queue
+    so one test's residue does not leak into the next.  getattr/setattr
+    is used to avoid Pyright complaining that the attribute is unknown
+    on the generic ``ModuleType`` — the global is dynamically assigned
+    via ``globals()[...]`` in the runtime code and static analysis
+    cannot see it.
+    """
+    m = sys.modules["mcp_pdb.main"]
+    original_mode = getattr(m, "caveman_mode")
+    while not m.pdb_output_queue.empty():
+        m.pdb_output_queue.get_nowait()
+
+    def _set(value: bool) -> None:
+        setattr(m, "caveman_mode", value)
+
+    try:
+        yield _set
+    finally:
+        setattr(m, "caveman_mode", original_mode)
+        while not m.pdb_output_queue.empty():
+            m.pdb_output_queue.get_nowait()
+
+
+def _seed_queue(*lines: str) -> None:
+    q = sys.modules["mcp_pdb.main"].pdb_output_queue
+    for line in lines:
+        q.put(line)
+
+
+class TestCavemanModeOutputStripping:
+    """Tests for caveman_mode prompt stripping in get_pdb_output.
+
+    get_pdb_output drains pdb_output_queue and, when caveman_mode is
+    enabled, removes bare '(Pdb)' prompt lines and strips the '(Pdb) '
+    prefix that can appear on the first response line.  These tests
+    directly exercise the transformation by seeding the shared queue.
+    """
+
+    def test_caveman_mode_off_preserves_prompt_lines(self, caveman_toggle):
+        """With caveman_mode=False, output is returned verbatim."""
+        caveman_toggle(False)
+        _seed_queue("-> x = 1", "(Pdb)")
+        out = get_pdb_output(timeout=0.2)
+        assert "-> x = 1" in out
+        assert "(Pdb)" in out
+
+    def test_caveman_mode_on_drops_bare_prompt_lines(self, caveman_toggle):
+        """With caveman_mode=True, a bare '(Pdb)' line is removed."""
+        caveman_toggle(True)
+        _seed_queue("-> x = 1", "(Pdb)")
+        out = get_pdb_output(timeout=0.2)
+        assert "-> x = 1" in out
+        assert "(Pdb)" not in out
+
+    def test_caveman_mode_on_strips_prompt_prefix(self, caveman_toggle):
+        """With caveman_mode=True, '(Pdb) value' becomes 'value'."""
+        caveman_toggle(True)
+        _seed_queue("(Pdb) 42", "(Pdb)")
+        out = get_pdb_output(timeout=0.2)
+        # Prefix stripped from the data line, bare prompt dropped entirely.
+        assert out.splitlines() == ["42"]
+
+    def test_caveman_mode_preserves_non_prompt_lines(self, caveman_toggle):
+        """Lines that merely contain '(Pdb)' in text are not modified."""
+        caveman_toggle(True)
+        # A variable whose repr happens to contain '(Pdb)' mid-line must
+        # not be altered.  Only leading-prefix or bare-line match.
+        _seed_queue("value with (Pdb) inside", "(Pdb)")
+        out = get_pdb_output(timeout=0.2)
+        assert "value with (Pdb) inside" in out
+
+
+class TestRemoteSessionStateIsolation:
+    """Verify that remote globals do not bleed into local session globals."""
+
+    def test_remote_globals_default_values(self):
+        """Remote-session globals should start at their documented defaults."""
+        import sys
+
+        # mcp_pdb/__init__.py shadows 'mcp_pdb.main' attribute with the
+        # main() function, so we retrieve the actual module from sys.modules
+        # (it is guaranteed to be present because other imports in this file
+        # already loaded it).
+        m = sys.modules["mcp_pdb.main"]
+
+        assert m.remote_mode is False          # type: ignore[attr-defined]
+        assert m.remote_socket is None         # type: ignore[attr-defined]
+        assert m.remote_host == ""             # type: ignore[attr-defined]
+        assert m.remote_port == 0              # type: ignore[attr-defined]
