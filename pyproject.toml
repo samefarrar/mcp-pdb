@@ -1,6 +1,6 @@
 [project]
 name = "mcp-pdb"
-version = "0.5.0"
+version = "0.6.0"
 description = "MCP to use the python debugger, inspired by debug-gym"
 readme = "README.md"
 authors = [
