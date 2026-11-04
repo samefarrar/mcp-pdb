@@ -1,16 +1,21 @@
 [project]
 name = "mcp-pdb"
-version = "0.7.0"
+version = "0.8.0"
 description = "MCP to use the python debugger, inspired by debug-gym"
 readme = "README.md"
 authors = [
     { name = "samefarrar", email = "67292186+samefarrar@users.noreply.github.com" },
 ]
 requires-python = ">=3.10"
-dependencies = ["mcp[cli]>=1.6.0,<2", "remote-pdb>=2.1.0"]
+dependencies = ["mcp>=2.3.0,<3", "remote-pdb>=2.1.0"]
 license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
@@ -20,7 +25,12 @@ mcp-pdb = "mcp_pdb:main"
 rpdb = "mcp_pdb.rpdb:main"
 
 [dependency-groups]
-dev = ["pytest>=8.0.0", "pyright>=1.1.400", "ruff>=0.11.0"]
+dev = [
+    # pytest 9.2.0 crashes with INTERNALERROR (NodeId._str_cache) on Python 3.10
+    "pytest>=9.1.1,!=9.2.0",
+    "pyright>=1.1.414",
+    "ruff>=0.17.3",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

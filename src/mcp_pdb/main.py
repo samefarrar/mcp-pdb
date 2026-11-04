@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import functools
 import logging
 import os
 import queue
@@ -29,16 +30,70 @@ import sys
 import threading
 import time
 import traceback
+from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
+from mcp.types import ToolAnnotations
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from typing import TypeVar
+
+    _F = TypeVar("_F", bound=Callable[..., str])
 
 log = logging.getLogger("mcp_pdb")
 
-mcp = FastMCP("mcp-pdb")
+try:
+    __version__ = version("mcp-pdb")
+except PackageNotFoundError:  # running from a source tree without metadata
+    __version__ = "0+unknown"
+
+_INSTRUCTIONS = """\
+Drive Python's pdb. Typical loop: start_debug (or connect_remote_debug) ->
+set_breakpoint -> send_pdb_command("c") -> examine_variable / send_pdb_command
+("n", "s", "w", "p expr") -> end_debug. Every call returns as soon as pdb is
+back at its prompt; if a command reports the program is still running, call
+get_output to keep waiting or interrupt to pause it. Breakpoints (including
+ones set with raw `b` commands) are restored by restart_debug. Pass
+caveman_mode=True to start_debug for compact output.
+"""
+
+mcp = MCPServer("mcp-pdb", version=__version__, instructions=_INSTRUCTIONS)
+
+# mcp >= 2 runs sync tools in worker threads, so concurrent tool calls could
+# interleave on pdb's stdin.  Every tool holds this (re-entrant: restart_debug
+# calls end_debug/start_debug) for its whole duration - except interrupt,
+# which must be able to signal a program while a long `c` is waiting.
+_session_lock = threading.RLock()
+
+_READ_ONLY = ToolAnnotations(read_only_hint=True, destructive_hint=False, open_world_hint=False)
+_SESSION = ToolAnnotations(read_only_hint=False, destructive_hint=False, open_world_hint=False)
+_ENDS_SESSION = ToolAnnotations(read_only_hint=False, destructive_hint=True, open_world_hint=False)
+
+
+def _tool(annotations: ToolAnnotations, *, locked: bool = True) -> Callable[[_F], _F]:
+    """Register an MCP tool: plain-text output, serialised on the session lock.
+
+    structured_output=False because a ``-> str`` tool would otherwise also
+    return its whole text a second time as ``structuredContent``.
+    """
+
+    def decorator(fn: _F) -> _F:
+        if locked:
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> str:
+                with _session_lock:
+                    return fn(*args, **kwargs)
+
+            target: Any = wrapper
+        else:
+            target = fn
+        mcp.tool(annotations=annotations, structured_output=False)(target)
+        return fn  # direct (in-process) callers get the undecorated function
+
+    return decorator
 
 # --- Tunables ---------------------------------------------------------------
 
@@ -75,18 +130,21 @@ NO_SESSION_MSG = (
 
 # With breakpoints set, pdb's tracer stays active during `continue`, so the
 # set_trace() inside its own SIGINT handler gets traced and the interrupt
-# stops in debugger internals instead of user code (CPython 3.10-3.13).
+# stops in debugger internals instead of user code (CPython 3.10-3.14).
 # Marking those modules as skipped makes the stop land in the user's frame
-# (and keeps `s` from stepping into them).  Sent once after startup; the
-# live Pdb instance is reached through its trace function.
+# (and keeps `s` from stepping into them).  Sent once after startup.  The
+# live debugger is found via gc rather than sys.gettrace(), because 3.14's
+# default sys.monitoring backend installs no trace function.
+_SKIP_MODULES = ("bdb", "pdb", "linecache", "contextlib")
 _SKIP_INTERNALS_CMD = (
-    "!(lambda d: setattr(d, 'skip', set(d.skip or ()) | "
-    "{'bdb', 'pdb', 'linecache', 'contextlib'}))(__import__('sys').gettrace().__self__)"
+    f"!(lambda bdb, gc: [setattr(d, 'skip', set(d.skip or ()) | set({_SKIP_MODULES!r})) "
+    "for d in gc.get_objects() if isinstance(d, bdb.Bdb)] and None)"
+    "(__import__('bdb'), __import__('gc'))"
 )
 
 # --- Global session state ---------------------------------------------------
-# Tool calls are serialised by FastMCP (sync tools run on the event-loop
-# thread), so plain module globals are safe here.
+# Tool calls are serialised by _session_lock, so plain module globals are
+# safe here.
 
 pdb_process: subprocess.Popen[bytes] | None = None
 pdb_output_queue: queue.Queue[str] = queue.Queue()
@@ -647,7 +705,7 @@ def _restore_breakpoints() -> str:
 # --- MCP tools --------------------------------------------------------------
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def start_debug(
     file_path: str, use_pytest: bool = False, args: str = "", caveman_mode: bool = False
 ) -> str:
@@ -765,7 +823,7 @@ def start_debug(
     ).rstrip()
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def connect_remote_debug(
     host: str = "localhost", port: int = 4444, timeout: int = 30, caveman_mode: bool = False
 ) -> str:
@@ -850,7 +908,7 @@ def connect_remote_debug(
     )
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def send_pdb_command(command: str, timeout: float | None = None) -> str:
     """Send a command to the running PDB instance.
 
@@ -891,7 +949,7 @@ def send_pdb_command(command: str, timeout: float | None = None) -> str:
     return f"Command output:\n{response}"
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def get_output(timeout: float = 10.0) -> str:
     """Wait for more output from the debuggee without sending a command.
 
@@ -918,7 +976,7 @@ def get_output(timeout: float = 10.0) -> str:
     return _truncate(f"{output}\n{status}" if output.strip() else status)
 
 
-@mcp.tool()
+@_tool(_SESSION, locked=False)
 def interrupt() -> str:
     """Pause a running program (like pressing Ctrl+C) and return to the prompt.
 
@@ -931,13 +989,22 @@ def interrupt() -> str:
         return "interrupt is not supported for remote sessions; press Ctrl+C in the remote process's terminal."
     if at_prompt:
         return "Already at the (Pdb) prompt; nothing to interrupt."
-    assert pdb_process is not None
-    if not _signal_group(pdb_process, signal.SIGINT):
+    proc = pdb_process
+    if proc is None:
+        return NO_SESSION_MSG
+    if not _signal_group(proc, signal.SIGINT):
         return "Could not signal the debuggee (it may have exited)."
-    return "Sent interrupt.\n" + get_output(timeout=5.0)
+    # If another call (e.g. a long `c`) holds the session, it will receive
+    # the "Program interrupted" output itself; don't race it for the queue.
+    if not _session_lock.acquire(blocking=False):
+        return "Sent interrupt. The in-flight command will return the new location."
+    try:
+        return "Sent interrupt.\n" + get_output(timeout=5.0)
+    finally:
+        _session_lock.release()
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def set_breakpoint(file_path: str, line_number: int, condition: str = "") -> str:
     """Set a breakpoint at a line, optionally conditional. Tracked across restarts.
 
@@ -968,7 +1035,7 @@ def set_breakpoint(file_path: str, line_number: int, condition: str = "") -> str
     return f"Breakpoint #{match.group(1)} set{' (if ' + condition + ')' if condition else ''}:\n{response}"
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def clear_breakpoint(file_path: str, line_number: int) -> str:
     """Clear the breakpoint(s) at a specific line in a file.
 
@@ -997,7 +1064,7 @@ def clear_breakpoint(file_path: str, line_number: int) -> str:
     return f"No breakpoint cleared. PDB response:\n{response}"
 
 
-@mcp.tool()
+@_tool(_READ_ONLY)
 def list_breakpoints() -> str:
     """List breakpoints known to PDB alongside those tracked for restarts."""
     tracked = _format_tracked_breakpoints()
@@ -1011,7 +1078,7 @@ def list_breakpoints() -> str:
     )
 
 
-@mcp.tool()
+@_tool(_ENDS_SESSION)
 def restart_debug() -> str:
     """Restart the session with the same file/args/pytest flag (or reconnect remote).
 
@@ -1079,7 +1146,7 @@ def _examine_command(expr: str, pretty: bool, attrs: bool, max_chars: int) -> st
     return f"!__import__('builtins').exec({code!r}, {{'_v': ({expr})}})"
 
 
-@mcp.tool()
+@_tool(_SESSION)
 def examine_variable(variable_name: str, include_attrs: bool = False, max_chars: int = 4000) -> str:
     """Examine a variable or expression: type, length, value and (optionally) attributes.
 
@@ -1106,7 +1173,7 @@ def examine_variable(variable_name: str, include_attrs: bool = False, max_chars:
     return f"--- Variable Examination: {expr} ---\n{response}"
 
 
-@mcp.tool()
+@_tool(_READ_ONLY)
 def get_debug_status() -> str:
     """Get the current status of the debugging session and tracked state."""
     global pdb_running
@@ -1149,7 +1216,7 @@ def get_debug_status() -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@_tool(_ENDS_SESSION)
 def end_debug() -> str:
     """End the current debugging session (local process or remote connection)."""
     global pdb_process, pdb_running, output_thread, at_prompt
@@ -1219,12 +1286,14 @@ atexit.register(cleanup)
 
 def main() -> None:
     """Run the MCP server over stdio."""
+    # force=True: MCPServer() already called basicConfig at import time.
     logging.basicConfig(
         stream=sys.stderr,
         level=os.environ.get("MCP_PDB_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
     )
-    log.info("Starting mcp-pdb (python=%s, cwd=%s)", sys.executable, os.getcwd())
+    log.info("Starting mcp-pdb %s (python=%s, cwd=%s)", __version__, sys.executable, os.getcwd())
     mcp.run()
 
 
