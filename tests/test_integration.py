@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -212,46 +213,115 @@ def test_remote_session_eof_is_detected(session, tmp_path):
         proc.wait()
 
 
-def test_mcp_stdio_stream_is_pure_json(project):
-    """Every line the server writes to stdout must be a JSON-RPC message."""
-    server = subprocess.Popen(
-        [sys.executable, "-c", "from mcp_pdb import main; main()"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    assert server.stdin is not None
-    assert server.stdout is not None
+class _StdioClient:
+    """Minimal raw JSON-RPC client for the server's stdio transport."""
 
-    def send(msg):
-        server.stdin.write(json.dumps(msg) + "\n")  # type: ignore[union-attr]
-        server.stdin.flush()  # type: ignore[union-attr]
+    def __init__(self):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", "from mcp_pdb import main; main()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        self.responses: dict[int, dict] = {}
+        self.non_json: list[str] = []
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+        self.request(0, "initialize", protocolVersion="2025-06-18", capabilities={},
+                     clientInfo={"name": "test", "version": "0"})  # fmt: skip
+        self.wait(0)
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
-    def call(id_, name, **arguments):
-        send({"jsonrpc": "2.0", "id": id_, "method": "tools/call",
-              "params": {"name": name, "arguments": arguments}})  # fmt: skip
-
-    try:
-        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
-            "protocolVersion": "2024-11-05", "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0"}}})  # fmt: skip
-        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        call(2, "start_debug", file_path=str(project / "app.py"))
-        call(3, "send_pdb_command", command="n")
-        call(4, "end_debug")
-
-        responses = {}
-        deadline = time.monotonic() + 30
-        while len(responses) < 4 and time.monotonic() < deadline:
-            line = server.stdout.readline()
-            if not line:
-                break
-            msg = json.loads(line)  # raises if anything non-JSON leaks
+    def _read(self):
+        assert self.proc.stdout is not None
+        for line in self.proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                self.non_json.append(line)
+                continue
             if "id" in msg:
-                responses[msg["id"]] = msg
-        assert set(responses) == {1, 2, 3, 4}
-        assert "app.py(2)" in responses[3]["result"]["content"][0]["text"]
-    finally:
-        server.kill()
-        server.wait()
+                self.responses[msg["id"]] = msg
+
+    def send(self, msg):
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def request(self, id_, method, **params):
+        self.send({"jsonrpc": "2.0", "id": id_, "method": method, "params": params})
+
+    def call(self, id_, name, **arguments):
+        self.request(id_, "tools/call", name=name, arguments=arguments)
+
+    def wait(self, *ids, timeout=30.0):
+        deadline = time.monotonic() + timeout
+        while not all(i in self.responses for i in ids):
+            assert time.monotonic() < deadline, f"no response for {ids}"
+            time.sleep(0.01)
+        return [self.responses[i] for i in ids]
+
+    def text(self, id_):
+        return self.wait(id_)[0]["result"]["content"][0]["text"]
+
+    def close(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+@pytest.fixture
+def stdio_client():
+    client = _StdioClient()
+    yield client
+    client.close()
+
+
+def test_mcp_stdio_stream_is_pure_json_and_calls_are_serialised(stdio_client, project):
+    """Pipelined calls (mcp>=2 runs sync tools in threads) must not interleave."""
+    c = stdio_client
+    c.call(1, "start_debug", file_path=str(project / "app.py"), caveman_mode=True)
+    c.call(2, "send_pdb_command", command="p 'first'")
+    c.call(3, "send_pdb_command", command="n")
+    c.call(4, "end_debug")
+    c.wait(1, 2, 3, 4)
+    assert c.text(2).splitlines()[-1] == "'first'"
+    assert "app.py(2)" in c.text(3)
+    assert c.non_json == []
+
+
+def test_mcp_tool_listing_and_plain_text_results(stdio_client):
+    c = stdio_client
+    init = c.wait(0)[0]["result"]
+    assert init["serverInfo"]["name"] == "mcp-pdb"
+    assert "start_debug" in init["instructions"]
+
+    c.request(1, "tools/list")
+    tools = {t["name"]: t for t in c.wait(1)[0]["result"]["tools"]}
+    assert {"start_debug", "get_output", "interrupt", "end_debug"} <= set(tools)
+    assert all("outputSchema" not in t for t in tools.values())
+    assert tools["list_breakpoints"]["annotations"]["readOnlyHint"] is True
+    assert tools["end_debug"]["annotations"]["destructiveHint"] is True
+
+    c.call(2, "get_debug_status")
+    result = c.wait(2)[0]["result"]
+    assert "structuredContent" not in result, "text must not be sent twice"
+
+
+@posix_only
+def test_mcp_interrupt_reaches_an_in_flight_continue(stdio_client, tmp_path):
+    """interrupt skips the session lock, so it works while `c` is blocking."""
+    (tmp_path / "requirements.txt").touch()
+    (tmp_path / "spin.py").write_text("import time\nwhile True:\n    time.sleep(0.05)\n")
+    c = stdio_client
+    c.call(1, "start_debug", file_path=str(tmp_path / "spin.py"), caveman_mode=True)
+    c.wait(1)
+    c.call(2, "send_pdb_command", command="c", timeout=20)
+    time.sleep(0.5)
+    started = time.monotonic()
+    c.call(3, "interrupt")
+    assert "in-flight command" in c.text(3)
+    assert "Program interrupted" in c.text(2)
+    assert time.monotonic() - started < 5, "continue should end at the interrupt, not its timeout"
+    c.call(4, "end_debug")
+    c.wait(4)

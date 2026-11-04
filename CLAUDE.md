@@ -29,6 +29,6 @@ This project is a debugging tool that integrates PDB (Python Debugger) with the 
   - Managing debug status
 
 ### Development Notes
-- The project uses the FastMCP framework for building MCP tools
+- Built on the `mcp` 2.x `MCPServer`; sync tools run in worker threads, so every tool (except `interrupt`) holds `_session_lock`
 - Never `print()` in `main.py`: stdout is the MCP JSON-RPC channel. Use `log` (stderr); a test enforces this
 - Breakpoints are tracked across debug sessions
