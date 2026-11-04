@@ -4,10 +4,8 @@ import os
 import queue
 import socket
 import sys
-import tempfile
 import threading
-import time  # noqa: F401 – used in test_emits_prompt_without_newline
-from pathlib import Path
+import time
 from unittest import mock
 
 import pytest
@@ -16,8 +14,8 @@ from mcp_pdb.main import (
     find_project_root,
     find_venv_details,
     get_pdb_output,
+    parse_arguments,
     read_socket_output,
-    sanitize_arguments,
 )
 
 
@@ -242,10 +240,8 @@ class TestFindVenvDetails:
         project_dir.mkdir()
 
         # Clear environment variables that might point to venvs
-        with mock.patch.dict(os.environ, {}, clear=True):
-            # Restore PATH for the test to work
-            with mock.patch.dict(os.environ, {"PATH": ""}, clear=True):
-                python_exe, bin_dir = find_venv_details(str(project_dir))
+        with mock.patch.dict(os.environ, {"PATH": ""}, clear=True):
+            python_exe, bin_dir = find_venv_details(str(project_dir))
 
         assert python_exe is None
         assert bin_dir is None
@@ -267,7 +263,7 @@ class TestFindVenvDetails:
             bin_dir.mkdir(parents=True)
             (bin_dir / python_name).touch()
 
-        python_exe, found_bin_dir = find_venv_details(str(project_dir))
+        python_exe, _ = find_venv_details(str(project_dir))
 
         # Should find .venv first (it's first in the list)
         expected_venv = project_dir / ".venv"
@@ -281,73 +277,37 @@ class TestFindVenvDetails:
         assert python_exe == str(expected_bin / python_name)
 
 
-class TestSanitizeArguments:
-    """Tests for sanitize_arguments function."""
+class TestParseArguments:
+    """Tests for parse_arguments (argv splitting; no shell is involved)."""
 
     def test_parses_simple_arguments(self):
-        """Should parse simple space-separated arguments."""
-        result = sanitize_arguments("--flag value")
-        assert result == ["--flag", "value"]
+        assert parse_arguments("--flag value") == ["--flag", "value"]
 
     def test_parses_quoted_arguments(self):
-        """Should handle quoted arguments with spaces."""
-        result = sanitize_arguments('--name "hello world"')
-        assert result == ["--name", "hello world"]
+        assert parse_arguments('--name "hello world"') == ["--name", "hello world"]
 
     def test_parses_empty_string(self):
-        """Should return empty list for empty string."""
-        result = sanitize_arguments("")
-        assert result == []
+        assert parse_arguments("") == []
 
-    def test_rejects_semicolon(self):
-        """Should reject arguments containing semicolon."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg1; rm -rf /")
+    @pytest.mark.parametrize(
+        ("args", "expected"),
+        [
+            ("-k 'a or b'", ["-k", "a or b"]),
+            ("--pattern=a|b", ["--pattern=a|b"]),
+            ("--expr 'x > 3'", ["--expr", "x > 3"]),
+            ("'a;b' '$(x)'", ["a;b", "$(x)"]),
+        ],
+    )
+    def test_shell_metacharacters_pass_through_literally(self, args, expected):
+        """The debuggee is launched from an argv list, so these are harmless."""
+        assert parse_arguments(args) == expected
 
-    def test_rejects_double_ampersand(self):
-        """Should reject arguments containing &&."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg1 && malicious")
-
-    def test_rejects_double_pipe(self):
-        """Should reject arguments containing ||."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg1 || fallback")
-
-    def test_rejects_backticks(self):
-        """Should reject arguments containing backticks."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("`whoami`")
-
-    def test_rejects_dollar_paren(self):
-        """Should reject arguments containing $(."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("$(whoami)")
-
-    def test_rejects_pipe(self):
-        """Should reject arguments containing pipe."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg | grep something")
-
-    def test_rejects_redirect_greater(self):
-        """Should reject arguments containing >."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg > /etc/passwd")
-
-    def test_rejects_redirect_less(self):
-        """Should reject arguments containing <."""
-        with pytest.raises(ValueError, match="Invalid character"):
-            sanitize_arguments("arg < /etc/passwd")
-
-    def test_parses_complex_valid_arguments(self):
-        """Should parse complex but valid arguments."""
-        result = sanitize_arguments('--config /path/to/config.json --verbose -n 5')
-        assert result == ["--config", "/path/to/config.json", "--verbose", "-n", "5"]
+    def test_rejects_unbalanced_quotes(self):
+        with pytest.raises(ValueError, match="Error parsing arguments"):
+            parse_arguments('--name "unterminated')
 
     def test_handles_equals_in_arguments(self):
-        """Should handle arguments with equals signs."""
-        result = sanitize_arguments("--key=value --other=123")
-        assert result == ["--key=value", "--other=123"]
+        assert parse_arguments("--key=value --other=123") == ["--key=value", "--other=123"]
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +397,7 @@ class TestReadSocketOutput:
         )
         t.start()
 
-        server_conn.sendall("résultat = 42\n".encode("utf-8"))
+        server_conn.sendall("résultat = 42\n".encode())
         server_conn.sendall(b"bad \xff byte\n")
         server_conn.close()
 
@@ -495,24 +455,17 @@ def caveman_toggle():
     """Yield a callable that sets caveman_mode on the real main module.
 
     Restores the original value on teardown and drains the shared queue
-    so one test's residue does not leak into the next.  getattr/setattr
-    is used to avoid Pyright complaining that the attribute is unknown
-    on the generic ``ModuleType`` — the global is dynamically assigned
-    via ``globals()[...]`` in the runtime code and static analysis
-    cannot see it.
+    so one test's residue does not leak into the next.
     """
     m = sys.modules["mcp_pdb.main"]
-    original_mode = getattr(m, "caveman_mode")
+    original_mode = m.caveman_mode
     while not m.pdb_output_queue.empty():
         m.pdb_output_queue.get_nowait()
 
-    def _set(value: bool) -> None:
-        setattr(m, "caveman_mode", value)
-
     try:
-        yield _set
+        yield m._set_caveman
     finally:
-        setattr(m, "caveman_mode", original_mode)
+        m._set_caveman(original_mode)
         while not m.pdb_output_queue.empty():
             m.pdb_output_queue.get_nowait()
 
