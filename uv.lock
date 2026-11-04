@@ -171,7 +171,7 @@ cli = [
 
 [[package]]
 name = "mcp-pdb"
-version = "0.6.0"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
@@ -187,7 +187,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0,<2" },
     { name = "remote-pdb", specifier = ">=2.1.0" },
 ]
 
