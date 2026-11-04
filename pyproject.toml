@@ -20,10 +20,27 @@ mcp-pdb = "mcp_pdb:main"
 rpdb = "mcp_pdb.rpdb:main"
 
 [dependency-groups]
-dev = ["pytest>=8.0.0"]
+dev = ["pytest>=8.0.0", "pyright>=1.1.400", "ruff>=0.11.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP", "SIM", "PT", "RUF", "T20", "TC", "C4", "PIE"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# main.py must never print (stdout is the MCP JSON-RPC channel); rpdb is a CLI.
+"src/mcp_pdb/rpdb.py" = ["T20"]
+"tests/**" = ["T20"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.10"
 
 [build-system]
 requires = ["hatchling"]
