@@ -29,6 +29,7 @@ Env vars:
                                connect before giving up (default 600).
                                Set to 0 to wait forever.
 """
+import contextlib
 import os
 import pdb as _pdb
 import select
@@ -217,7 +218,7 @@ class DualPdb(_pdb.Pdb):
             srv.listen(1)
             try:
                 self._conn, addr = srv.accept()
-            except _socket.timeout as e:
+            except TimeoutError as e:
                 raise SystemExit(
                     f"rpdb: no mcp client connected within "
                     f"{_ACCEPT_TIMEOUT:.0f}s. Set "
@@ -238,8 +239,8 @@ class DualPdb(_pdb.Pdb):
         local_out: IO[str] = sys.__stdout__ or sys.stdout
 
         super().__init__(
-            stdin=cast(IO[str],  _SelectStdin(local_in,  self._sock_file)),
-            stdout=cast(IO[str], _TeeOutput(local_out, self._conn)),
+            stdin=cast("IO[str]",  _SelectStdin(local_in,  self._sock_file)),
+            stdout=cast("IO[str]", _TeeOutput(local_out, self._conn)),
         )
 
     def set_trace(self, frame: FrameType | None = None) -> None:  # type: ignore[override]
@@ -251,14 +252,10 @@ class DualPdb(_pdb.Pdb):
 
     def do_quit(self, arg: str) -> bool | None:  # type: ignore[override]
         """Close the remote socket before handing off to pdb's quit handler."""
-        try:
+        with contextlib.suppress(OSError):
             self._sock_file.close()
-        except OSError:
-            pass
-        try:
+        with contextlib.suppress(OSError):
             self._conn.close()
-        except OSError:
-            pass
         return super().do_quit(arg)
 
     do_q = do_exit = do_quit  # type: ignore[assignment]

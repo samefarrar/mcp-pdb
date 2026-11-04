@@ -1,174 +1,308 @@
+"""MCP server that drives the Python debugger (pdb) for an LLM agent.
+
+Two transports are supported:
+
+* **local** - ``start_debug`` launches ``python -m pdb`` / ``pytest --pdb`` as a
+  subprocess and talks to it over stdin/stdout.
+* **remote** - ``connect_remote_debug`` attaches to a pdb listening on a TCP
+  socket (``rpdb``, ``remote_pdb.RemotePdb`` ...).
+
+IMPORTANT: this server speaks JSON-RPC over *stdout*.  Nothing in this module
+may write to stdout - all diagnostics go through ``log`` (stderr).
+"""
+
+from __future__ import annotations
+
 import atexit
+import contextlib
+import logging
 import os
 import queue
 import re
+import select
 import shlex
 import shutil
 import signal
-import select
 import socket as socket_module
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from typing import TYPE_CHECKING, Any
 
 from mcp.server.fastmcp import FastMCP
 
-# Initialize FastMCP server
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+log = logging.getLogger("mcp_pdb")
+
 mcp = FastMCP("mcp-pdb")
 
-# --- Global Variables ---
-pdb_process = None
-pdb_output_queue = queue.Queue()
+# --- Tunables ---------------------------------------------------------------
+
+# Every wait returns as soon as pdb prints its prompt, so these are ceilings,
+# not delays.
+DEFAULT_TIMEOUT = 10.0  # ordinary commands (p, l, b, ...)
+LONG_RUNNING_TIMEOUT = 30.0  # commands that run user code (c, r, unt, ...)
+STARTUP_TIMEOUT = 60.0  # first prompt (uv may need to sync an env first)
+MAX_OUTPUT_CHARS = 20_000  # per tool result; middle is elided beyond this
+
+# Matches "(Pdb) " and nested-debugger prompts such as "((Pdb)) ".
+_PROMPT_RE = re.compile(r"\(+Pdb\)+\s*$")
+_PROMPT_PREFIX_RE = re.compile(r"^\(+Pdb\)+ ")
+_BP_SET_RE = re.compile(r"^(?:\(+Pdb\)+ )?Breakpoint (\d+) at (.+):(\d+)\s*$", re.M)
+_BP_DEL_RE = re.compile(
+    r"^(?:\(+Pdb\)+ )?Deleted breakpoint (\d+) at (.+):(\d+)\s*$", re.M
+)
+
+# Commands that resume user code and may take a while to return a prompt.
+LONG_RUNNING_COMMANDS = frozenset(
+    {"c", "cont", "continue", "r", "return", "unt", "until", "run", "restart"}
+)
+# Commands after which verbose mode appends the source window.
+NAV_COMMANDS = frozenset(
+    {
+        "n", "next", "s", "step", "c", "cont", "continue", "r", "return",
+        "unt", "until", "j", "jump",
+    }
+)  # fmt: skip
+
+NO_SESSION_MSG = (
+    "No active debugging session. Use start_debug or connect_remote_debug first."
+)
+
+# With breakpoints set, pdb's tracer stays active during `continue`, so the
+# set_trace() inside its own SIGINT handler gets traced and the interrupt
+# stops in debugger internals instead of user code (CPython 3.10-3.13).
+# Marking those modules as skipped makes the stop land in the user's frame
+# (and keeps `s` from stepping into them).  Sent once after startup; the
+# live Pdb instance is reached through its trace function.
+_SKIP_INTERNALS_CMD = (
+    "!(lambda d: setattr(d, 'skip', set(d.skip or ()) | "
+    "{'bdb', 'pdb', 'linecache', 'contextlib'}))(__import__('sys').gettrace().__self__)"
+)
+
+# --- Global session state ---------------------------------------------------
+# Tool calls are serialised by FastMCP (sync tools run on the event-loop
+# thread), so plain module globals are safe here.
+
+pdb_process: subprocess.Popen[bytes] | None = None
+pdb_output_queue: queue.Queue[str] = queue.Queue()
 pdb_running = False
-current_file = None           # Absolute path of the file being debugged
-current_project_root = None # Root directory of the project being debugged
-current_args = ""             # Additional args passed to the script/pytest
-current_use_pytest = False    # Flag indicating if pytest was used
-breakpoints = {}              # Tracks breakpoints: {abs_file_path: {line_num: {command_str, bp_number}}}
-output_thread = None          # Thread object for reading output
-caveman_mode = False          # When True: compact output; False (default): full verbose output
+at_prompt = False  # True when the last read ended on a (Pdb) prompt
+current_file: str | None = None  # absolute path of the file being debugged
+current_project_root: str | None = None
+current_args = ""
+current_use_pytest = False
+output_thread: threading.Thread | None = None
+caveman_mode = False  # compact output when True
+# Set by the reader thread when its stream hits EOF.  Replaced per session so
+# a stale reader can never flag a newer session as closed.
+stream_eof = threading.Event()
+
+# Breakpoints tracked across restarts:
+# {abs_file_path: {line: {"bp_number": str | None, "condition": str | None,
+#                         "project_root": str | None}}}
+breakpoints: dict[str, dict[int, dict[str, Any]]] = {}
 
 # Remote PDB session state
-remote_socket = None          # Connected socket for remote PDB
-remote_mode = False           # True when connected to a remote PDB session
-remote_host = ""              # Remote hostname/IP
-remote_port = 0               # Remote TCP port
-
-# --- Helper Functions ---
-
-def read_pdb_output(process, output_queue):
-    """Read output from the pdb process and put it in the queue."""
-    try:
-        # Use iter() with readline to avoid blocking readline() indefinitely
-        # if the process exits unexpectedly or stdout closes.
-        for line_bytes in iter(process.stdout.readline, b''):
-            output_queue.put(line_bytes.decode('utf-8', errors='replace').rstrip())
-    except ValueError:
-        # Handle ValueError if stdout is closed prematurely (e.g., process killed)
-        print("PDB output reader: ValueError (stdout likely closed).", file=sys.stderr)
-    except Exception as e:
-        print(f"PDB output reader: Unexpected error: {e}", file=sys.stderr)
-    finally:
-        # Ensure stdout is closed if loop finishes normally or breaks
-        if process and process.stdout and not process.stdout.closed:
-             try:
-                 process.stdout.close()
-             except Exception as e:
-                 print(f"PDB output reader: Error closing stdout: {e}", file=sys.stderr)
-        print("PDB output reader thread finished.", file=sys.stderr)
+remote_socket: socket_module.socket | None = None
+remote_mode = False
+remote_host = ""
+remote_port = 0
 
 
-def read_socket_output(sock: socket_module.socket, output_queue: queue.Queue) -> None:
-    """Read output from a remote PDB socket and put it in the queue.
+# --- Output plumbing --------------------------------------------------------
 
-    Uses recv() + select() instead of readline() so that the (Pdb) prompt
-    — which has no trailing newline — is emitted without blocking.
 
-    After draining all newline-terminated lines from a recv() chunk, a
-    select() with a short timeout checks whether more data is arriving
-    immediately.  If not, whatever remains in the buffer (typically
-    the bare '(Pdb) ' prompt) is emitted as-is.
+def _decode(data: bytes) -> str:
+    return data.decode("utf-8", errors="replace").rstrip("\r")
+
+
+def _is_prompt(line: str) -> bool:
+    return bool(_PROMPT_RE.search(line))
+
+
+def _pump_stream(
+    recv: Callable[[], bytes],
+    more_pending: Callable[[], bool] | None,
+    output_queue: queue.Queue[str],
+    eof_event: threading.Event | None,
+    label: str,
+) -> None:
+    """Read chunks from ``recv`` and push decoded lines onto ``output_queue``.
+
+    pdb's ``(Pdb) `` prompt has no trailing newline, so a line-based reader
+    would sit on it until the *next* command produced output.  Instead,
+    after splitting off complete lines, any residue is emitted immediately
+    when it looks like a prompt, or when ``more_pending`` reports that no
+    further bytes are arriving (e.g. an ``input()`` prompt from user code).
     """
     buf = b""
     try:
         while True:
             try:
-                chunk = sock.recv(4096)
-            except OSError as e:
-                print(f"Remote PDB reader: recv error: {e}", file=sys.stderr)
+                chunk = recv()
+            except (OSError, ValueError) as e:
+                log.debug("%s reader: read error: %s", label, e)
                 break
             if not chunk:
                 break
             buf += chunk
-
-            # Emit all newline-terminated lines.  Strip only '\r' so that
-            # intentional trailing whitespace inside variable reprs (e.g.
-            # "'hello   '") is preserved.
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
-                output_queue.put(
-                    line.decode("utf-8", errors="replace").rstrip("\r")
-                )
-
-            # If residual bytes remain (no \n), check whether more data is
-            # arriving within 50 ms.  If not, emit them now — they are almost
-            # certainly the '(Pdb) ' prompt.
+                output_queue.put(_decode(line))
             if buf:
-                r, _, _ = select.select([sock], [], [], 0.05)
-                if not r:
-                    output_queue.put(
-                        buf.decode("utf-8", errors="replace").rstrip("\r")
-                    )
+                text = _decode(buf)
+                if _is_prompt(text) or (more_pending is not None and not more_pending()):
+                    output_queue.put(text)
                     buf = b""
-    except Exception as e:
-        print(f"Remote PDB reader: unexpected error: {e}", file=sys.stderr)
+    except Exception:
+        log.exception("%s reader: unexpected error", label)
     finally:
         if buf:
-            output_queue.put(
-                buf.decode("utf-8", errors="replace").rstrip("\r")
-            )
-        print("Remote PDB output reader thread finished.", file=sys.stderr)
+            output_queue.put(_decode(buf))
+        if eof_event is not None:
+            eof_event.set()
+        log.debug("%s reader thread finished.", label)
 
 
-def get_pdb_output(timeout=0.5):
-    """Get accumulated output from the pdb process queue."""
-    output = []
-    start_time = time.monotonic()
+def read_pdb_output(
+    process: subprocess.Popen[bytes],
+    output_queue: queue.Queue[str],
+    eof_event: threading.Event | None = None,
+) -> None:
+    """Reader thread for a local pdb subprocess."""
+    stdout = process.stdout
+    if stdout is None:
+        if eof_event is not None:
+            eof_event.set()
+        return
+    fd = stdout.fileno()
+
+    def pipe_has_data() -> bool:
+        return bool(select.select([fd], [], [], 0.05)[0])
+
+    # select() does not support pipes on Windows; rely on prompt detection.
+    more_pending = None if sys.platform == "win32" else pipe_has_data
+    try:
+        _pump_stream(
+            lambda: os.read(fd, 4096), more_pending, output_queue, eof_event, "local"
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            stdout.close()
+
+
+def read_socket_output(
+    sock: socket_module.socket,
+    output_queue: queue.Queue[str],
+    eof_event: threading.Event | None = None,
+) -> None:
+    """Reader thread for a remote pdb socket."""
+
+    def more_pending() -> bool:
+        return bool(select.select([sock], [], [], 0.05)[0])
+
+    _pump_stream(lambda: sock.recv(4096), more_pending, output_queue, eof_event, "remote")
+
+
+def _drain_queue() -> list[str]:
+    lines: list[str] = []
     while True:
         try:
-            # Calculate remaining time
-            remaining_time = timeout - (time.monotonic() - start_time)
-            if remaining_time <= 0:
-                break
-            line = pdb_output_queue.get(timeout=remaining_time)
-            output.append(line)
-            # Heuristic: If we see the pdb prompt, we likely have the main response
-            # Be careful as some commands might produce output containing (Pdb)
-            # Let's rely more on the timeout for now, but keep this in mind.
-            if line.strip().endswith('(Pdb)'):
-                break
+            lines.append(pdb_output_queue.get_nowait())
         except queue.Empty:
-            break # Timeout reached
-    # In caveman_mode: strip bare '(Pdb)' prompt lines and the '(Pdb) ' prefix
-    # that appears on the first response line when the reader was blocked on the
-    # previous prompt.  In verbose mode keep the raw output unchanged.
-    if not caveman_mode:
-        return '\n'.join(output)
-    cleaned = []
-    for line in output:
-        if line.strip() == '(Pdb)':
+            return lines
+
+
+def _collect_output(timeout: float) -> tuple[list[str], bool]:
+    """Collect queued lines until a prompt, EOF, or ``timeout`` seconds.
+
+    Returns ``(lines, saw_prompt)``.
+    """
+    lines: list[str] = []
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return lines, False
+        try:
+            line = pdb_output_queue.get(timeout=min(remaining, 0.1))
+        except queue.Empty:
+            # The reader puts its last line before setting the event, so an
+            # empty queue after the event means everything has been read.
+            if stream_eof.is_set() and pdb_output_queue.empty():
+                return lines, False
             continue
-        if line.startswith('(Pdb) '):
-            line = line[6:]
-        cleaned.append(line)
-    return '\n'.join(cleaned)
+        lines.append(line)
+        if _is_prompt(line):
+            return lines, True
+
+
+def _format_output(lines: list[str]) -> str:
+    """Join output lines; in caveman mode drop pdb prompts."""
+    if not caveman_mode:
+        return "\n".join(lines)
+    cleaned = []
+    for line in lines:
+        if _PROMPT_RE.fullmatch(line.strip()):
+            continue
+        cleaned.append(_PROMPT_PREFIX_RE.sub("", line, count=1))
+    return "\n".join(cleaned)
+
+
+def get_pdb_output(timeout: float = 0.5) -> str:
+    """Return output accumulated until the next prompt (or ``timeout``)."""
+    global at_prompt
+    lines, saw_prompt = _collect_output(timeout)
+    if lines:
+        at_prompt = saw_prompt
+    return _format_output(lines)
+
+
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n[... {omitted} characters omitted ...]\n\n{text[-tail:]}"
+
+
+def _command_word(command: str) -> str:
+    parts = command.strip().split(maxsplit=1)
+    return parts[0].lower() if parts else ""
+
+
+# --- Session helpers --------------------------------------------------------
+
+
+def _set_caveman(value: bool) -> None:
+    global caveman_mode
+    caveman_mode = bool(value)
 
 
 def _is_local_process_alive() -> bool:
-    """Return True if the local PDB subprocess is still running."""
     return pdb_process is not None and pdb_process.poll() is None
 
 
 def _is_remote_connected() -> bool:
-    """Return True if the remote socket reference is still set.
+    """True while the remote socket is open and its reader has not seen EOF."""
+    return remote_socket is not None and not stream_eof.is_set()
 
-    Note: this checks object identity, not socket liveness — a socket that
-    was closed by the peer will still pass this check until cleanup runs.
-    """
-    return remote_socket is not None
+
+def _session_alive() -> bool:
+    return _is_remote_connected() if remote_mode else _is_local_process_alive()
 
 
 def _clear_remote_state() -> None:
     """Reset every remote_* global to the idle default.
 
-    Every cleanup path MUST call this instead of touching the globals
-    individually.  The invariant is: if ``remote_socket is None`` then
-    ``remote_mode is False`` and host/port are empty — there is no valid
-    intermediate state.  Prior to this helper, partial resets left
-    ``remote_mode=True`` after error paths which corrupted ``restart_debug``
-    and ``get_debug_status``.
+    Invariant: if ``remote_socket is None`` then ``remote_mode is False``
+    and host/port are empty - there is no valid intermediate state.
     """
     global remote_socket, remote_mode, remote_host, remote_port
     remote_socket = None
@@ -177,1300 +311,922 @@ def _clear_remote_state() -> None:
     remote_port = 0
 
 
-def send_to_pdb(command, timeout_multiplier=1.0):
-    """Send a command to the pdb process (local or remote) and get its response.
+def _close_socket(sock: socket_module.socket) -> None:
+    # shutdown() before close() so a reader blocked in recv()/select()
+    # unblocks immediately on every POSIX implementation.
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket_module.SHUT_RDWR)
+    with contextlib.suppress(OSError):
+        sock.close()
 
-    Works for both:
-    - Local sessions (subprocess stdin/stdout)
-    - Remote sessions (TCP socket)
 
-    Args:
-        command: The PDB command to send
-        timeout_multiplier: Multiplier to adjust timeout for complex commands
-    """
-    # pdb_running is the only global mutated here; others are read-only
-    # (remote_socket / remote_mode are cleared via _clear_remote_state).
-    global pdb_running
-
-    # Resolve and type-narrow the active transport before any I/O by binding
-    # to local variables.  Local rebind survives -O (assert is stripped).
-    rsock: socket_module.socket | None = None
-    lproc: subprocess.Popen | None = None
-    if remote_mode:
-        rsock = remote_socket
-        if rsock is None:
-            if pdb_running:
-                pdb_running = False
-                final_output = get_pdb_output(timeout=0.1)
-                return (
-                    "No active remote pdb connection.\n"
-                    f"Final Output:\n{final_output}"
-                )
-            return "No active remote pdb connection."
-    else:
-        lproc = pdb_process
-        if lproc is None or lproc.poll() is not None:
-            if pdb_running:
-                pdb_running = False
-                final_output = get_pdb_output(timeout=0.1)
-                return (
-                    "No active pdb process (it terminated).\n"
-                    f"Final Output:\n{final_output}"
-                )
-            return "No active pdb process."
-
-    # Clear queue before sending command to get only relevant output
-    while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
-
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> bool:
+    """Send ``sig`` to the debuggee's process group. Returns False if gone."""
     try:
-        # Determine appropriate timeout based on command type
-        base_timeout = 1.5
-        if command.strip().lower() in ('c', 'continue', 'r', 'run', 'until', 'unt'):
-            timeout = base_timeout * 3 * timeout_multiplier
+        if sys.platform == "win32":
+            if sig == signal.SIGINT:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+            elif sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
         else:
-            timeout = base_timeout * timeout_multiplier
+            os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
 
-        if rsock is not None:
-            # TCP socket: sendall is synchronous, no flush needed.
-            rsock.sendall((command + '\n').encode('utf-8'))
-        else:
-            assert lproc is not None  # narrowed above; here for the type checker
-            stdin = lproc.stdin
-            if stdin is None:
-                return "Error: PDB process stdin is not available."
-            stdin.write((command + '\n').encode('utf-8'))
-            stdin.flush()
 
-        output = get_pdb_output(timeout=timeout)
+def _relpath_for_pdb(abs_path: str) -> str:
+    """Path to hand to pdb: relative to the project root when inside it."""
+    if current_project_root:
+        try:
+            rel = os.path.relpath(abs_path, current_project_root)
+        except ValueError:  # different drive on Windows
+            return abs_path
+        if not rel.startswith(".."):
+            return rel
+    return abs_path
 
-        # For local sessions, check if process ended after the command
-        if lproc is not None and lproc.poll() is not None:
+
+def _sync_breakpoints(output: str) -> None:
+    """Mirror pdb's own breakpoint confirmations into ``breakpoints``.
+
+    This catches breakpoints set or cleared through raw ``send_pdb_command``
+    calls too, so restarts restore everything pdb knew about.  Remote
+    sessions are skipped: their paths live on another machine/process.
+    """
+    if remote_mode:
+        return
+    for num, path, line in _BP_SET_RE.findall(output):
+        entry = breakpoints.setdefault(os.path.abspath(path), {}).setdefault(
+            int(line), {"condition": None}
+        )
+        entry["bp_number"] = num
+        entry["project_root"] = current_project_root
+    for num, path, line in _BP_DEL_RE.findall(output):
+        file_bps = breakpoints.get(os.path.abspath(path), {})
+        entry = file_bps.get(int(line))
+        if entry is not None and entry.get("bp_number") in (num, None):
+            del file_bps[int(line)]
+            if not file_bps:
+                breakpoints.pop(os.path.abspath(path), None)
+
+
+def _format_tracked_breakpoints() -> list[str]:
+    items = []
+    for abs_path in sorted(breakpoints):
+        for line_num in sorted(breakpoints[abs_path]):
+            data = breakpoints[abs_path][line_num]
+            item = f"{_relpath_for_pdb(abs_path)}:{line_num}"
+            if data.get("bp_number"):
+                item += f" (BP #{data['bp_number']})"
+            if data.get("condition"):
+                item += f" if {data['condition']}"
+            items.append(item)
+    return items
+
+
+def _session_ended_notice() -> str:
+    return "\n\n*** The debugging session has ended. ***"
+
+
+def send_to_pdb(command: str, timeout: float | None = None) -> str:
+    """Send a command to pdb (local or remote) and return its response.
+
+    Waits until pdb prints its next prompt, the stream closes, or
+    ``timeout`` seconds pass.  Output that arrived *between* commands (e.g.
+    the tail of a long ``continue``) is returned first rather than dropped.
+    """
+    global pdb_running, at_prompt
+
+    if not _session_alive():
+        if pdb_running:
             pdb_running = False
-            final_output = get_pdb_output(timeout=0.1)
-            return (
-                f"Command output:\n{output}\n{final_output}\n\n"
-                "*** The debugging session has ended. ***"
-            )
+            leftover = _format_output(_drain_queue())
+            return f"The debugging session has ended.\nFinal output:\n{leftover}"
+        return NO_SESSION_MSG
 
-        return output
+    pending = _drain_queue()
+    if timeout is None:
+        timeout = (
+            LONG_RUNNING_TIMEOUT
+            if _command_word(command) in LONG_RUNNING_COMMANDS
+            else DEFAULT_TIMEOUT
+        )
 
-    except (OSError, BrokenPipeError) as e:
-        print(f"Error writing to PDB: {e}", file=sys.stderr)
-        pdb_running = False
-        final_output = get_pdb_output(timeout=0.1)
+    rsock = remote_socket if remote_mode else None
+    lproc = None if remote_mode else pdb_process
+    try:
+        data = (command + "\n").encode("utf-8")
         if rsock is not None:
-            # Remote transport is dead; fully clear remote state so
-            # restart_debug/get_debug_status do not observe a zombie
-            # (remote_mode=True, remote_socket=None) half-state.
-            try:
-                rsock.shutdown(socket_module.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                rsock.close()
-            except OSError:
-                pass
-            _clear_remote_state()
-        elif pdb_process:
-            pdb_process.terminate()
-            pdb_process.wait(timeout=0.5)
-        return (f"Error communicating with PDB: {e}\n"
-                f"Final Output:\n{final_output}\n\n"
-                "*** The debugging session has likely ended. ***")
-    except Exception as e:
-        print(f"Unexpected error in send_to_pdb: {e}", file=sys.stderr)
+            rsock.sendall(data)
+        else:
+            assert lproc is not None  # guaranteed by _session_alive()
+            if lproc.stdin is None:
+                return "Error: PDB process stdin is not available."
+            lproc.stdin.write(data)
+            lproc.stdin.flush()
+        at_prompt = False
+        lines, saw_prompt = _collect_output(timeout)
+    except OSError as e:
+        log.warning("Error communicating with PDB: %s", e)
         pdb_running = False
+        at_prompt = False
         if rsock is not None:
-            # Match the OSError path: shutdown() before close() so the
-            # reader thread unblocks from recv()/select() immediately.
-            try:
-                rsock.shutdown(socket_module.SHUT_RDWR)
-            except OSError:
-                pass
-            try:
-                rsock.close()
-            except OSError:
-                pass
+            _close_socket(rsock)
             _clear_remote_state()
-        return f"Unexpected error sending command: {e}"
+        elif lproc is not None:
+            _signal_group(lproc, signal.SIGTERM)
+        leftover = _format_output(pending + _drain_queue())
+        return (
+            f"Error communicating with PDB: {e}\nFinal output:\n{leftover}"
+            + _session_ended_notice()
+        )
+
+    at_prompt = saw_prompt
+    raw = "\n".join(pending + lines)
+    _sync_breakpoints(raw)
+
+    output = _format_output(lines)
+    pending_text = _format_output(pending).strip()
+    if pending_text:
+        output = (
+            "[Output received since the previous command]\n"
+            f"{pending_text}\n[Response]\n{output}"
+        )
+
+    if not _session_alive():
+        # Give the reader a moment to deliver the process's last words.
+        if not remote_mode and lproc is not None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                lproc.wait(timeout=1.0)
+        more, _ = _collect_output(0.5)
+        if more:
+            output += "\n" + _format_output(more)
+        pdb_running = False
+        return _truncate(output) + _session_ended_notice()
+
+    if not saw_prompt:
+        output += (
+            f"\n\n[No (Pdb) prompt after {timeout:g}s - the program is still "
+            "running. Call get_output to wait for more output, or interrupt "
+            "to pause it.]"
+        )
+    return _truncate(output)
 
 
-def find_project_root(start_path):
-    """Find the project root containing pyproject.toml, .git or other indicators, searching upwards."""
+# --- Environment discovery --------------------------------------------------
+
+
+def find_project_root(start_path: str) -> str:
+    """Find the nearest ancestor containing a project marker."""
     current_dir = os.path.abspath(start_path)
-    # Common project root indicators
-    root_indicators = ["pyproject.toml", ".git", "setup.py", "requirements.txt", "Pipfile", "poetry.lock"]
-
-    # Guard against infinite loop if start_path is already root
+    root_indicators = [
+        "pyproject.toml", ".git", "setup.py", "requirements.txt", "Pipfile",
+        "poetry.lock",
+    ]  # fmt: skip
     while current_dir and current_dir != os.path.dirname(current_dir):
         for indicator in root_indicators:
             if os.path.exists(os.path.join(current_dir, indicator)):
-                print(f"Found project root indicator '{indicator}' at: {current_dir}")
+                log.info("Found project root indicator %r at %s", indicator, current_dir)
                 return current_dir
         current_dir = os.path.dirname(current_dir)
 
-    # Fallback to the starting path's directory if no indicator found
     fallback_dir = os.path.abspath(start_path)
-    print(f"No common project root indicators found upwards. Falling back to: {fallback_dir}")
+    log.info("No project root indicators found; using %s", fallback_dir)
     return fallback_dir
 
 
-def find_venv_details(project_root):
-    """Check for virtual environment directories and return python path and bin dir.
+def _venv_python(venv_path: str) -> tuple[str, str]:
+    if sys.platform == "win32":
+        bin_dir = os.path.join(venv_path, "Scripts")
+        return os.path.join(bin_dir, "python.exe"), bin_dir
+    bin_dir = os.path.join(venv_path, "bin")
+    return os.path.join(bin_dir, "python"), bin_dir
 
-    Note: We prioritize scanning for venv directories in the project root over
-    environment variables (VIRTUAL_ENV, CONDA_PREFIX) because when mcp-pdb runs
-    under uv or other tools, these environment variables point to mcp-pdb's own
-    environment, not the debuggee's environment.
+
+def find_venv_details(project_root: str) -> tuple[str | None, str | None]:
+    """Return ``(python_exe, bin_dir)`` for the project's virtualenv, if any.
+
+    Venv directories in the project (and its parent) are checked before
+    VIRTUAL_ENV / CONDA_PREFIX, because when mcp-pdb itself runs under uv
+    those variables describe mcp-pdb's environment, not the debuggee's.
+    Returns ``(None, None)`` when nothing is found; the caller then falls
+    back to the system interpreter.
     """
-    common_venv_names = ['.venv', 'venv', 'env', '.env', 'virtualenv', '.virtualenv']
-    common_venv_locations = [project_root]
-
-    # Also check parent directory as some projects keep venvs one level up
+    common_venv_names = [".venv", "venv", "env", ".env", "virtualenv", ".virtualenv"]
+    locations = [project_root]
     parent_dir = os.path.dirname(project_root)
-    if parent_dir != project_root:  # Avoid infinite loop at filesystem root
-        common_venv_locations.append(parent_dir)
+    if parent_dir != project_root:
+        locations.append(parent_dir)
 
-    # First, scan for venv directories in the project root and parent
-    # This takes priority over environment variables because VIRTUAL_ENV/CONDA_PREFIX
-    # may point to mcp-pdb's own environment when running under uv
-    for location in common_venv_locations:
+    for location in locations:
         for name in common_venv_names:
             venv_path = os.path.join(location, name)
             if os.path.isdir(venv_path):
-                if sys.platform == "win32":
-                    python_exe = os.path.join(venv_path, 'Scripts', 'python.exe')
-                    bin_dir = os.path.join(venv_path, 'Scripts')
-                else:
-                    python_exe = os.path.join(venv_path, 'bin', 'python')
-                    bin_dir = os.path.join(venv_path, 'bin')
-
+                python_exe, bin_dir = _venv_python(venv_path)
                 if os.path.exists(python_exe):
-                    print(f"Found virtual environment: {venv_path}")
+                    log.info("Found virtual environment: %s", venv_path)
                     return python_exe, bin_dir
 
-    # Fallback: Check environment variables pointing to active virtual env
-    # Note: These are checked AFTER scanning for project venv directories because
-    # when running under uv, these may point to mcp-pdb's own environment
-    if 'VIRTUAL_ENV' in os.environ:
-        venv_path = os.environ['VIRTUAL_ENV']
-        if os.path.isdir(venv_path):
-            if sys.platform == "win32":
-                python_exe = os.path.join(venv_path, 'Scripts', 'python.exe')
-                bin_dir = os.path.join(venv_path, 'Scripts')
-            else:
-                python_exe = os.path.join(venv_path, 'bin', 'python')
-                bin_dir = os.path.join(venv_path, 'bin')
-
-            if os.path.exists(python_exe):
-                print(f"Found active virtual environment from VIRTUAL_ENV: {venv_path}")
-                return python_exe, bin_dir
-
-    # Check for conda environment (also as fallback)
-    if 'CONDA_PREFIX' in os.environ:
-        conda_path = os.environ['CONDA_PREFIX']
-        if sys.platform == "win32":
-            python_exe = os.path.join(conda_path, 'python.exe')
-            bin_dir = conda_path
-        else:
-            python_exe = os.path.join(conda_path, 'bin', 'python')
-            bin_dir = os.path.join(conda_path, 'bin')
-
+    venv_env = os.environ.get("VIRTUAL_ENV")
+    if venv_env and os.path.isdir(venv_env):
+        python_exe, bin_dir = _venv_python(venv_env)
         if os.path.exists(python_exe):
-            print(f"Found conda environment from CONDA_PREFIX: {conda_path}")
+            log.info("Using VIRTUAL_ENV: %s", venv_env)
             return python_exe, bin_dir
 
-    # Look for other common Python installations
-    if sys.platform == "win32":
-        for path in os.environ["PATH"].split(os.pathsep):
-            py_exe = os.path.join(path, "python.exe")
-            if os.path.exists(py_exe):
-                return py_exe, path
-    else:
-        # On Unix, check if we have a user-installed Python in .local/bin
-        local_bin = os.path.expanduser("~/.local/bin")
-        if os.path.exists(local_bin):
-            for f in os.listdir(local_bin):
-                if f.startswith("python") and os.path.isfile(os.path.join(local_bin, f)):
-                    py_exe = os.path.join(local_bin, f)
-                    return py_exe, local_bin
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        if sys.platform == "win32":
+            python_exe, bin_dir = os.path.join(conda_prefix, "python.exe"), conda_prefix
+        else:
+            bin_dir = os.path.join(conda_prefix, "bin")
+            python_exe = os.path.join(bin_dir, "python")
+        if os.path.exists(python_exe):
+            log.info("Using CONDA_PREFIX: %s", conda_prefix)
+            return python_exe, bin_dir
 
-    print(f"No virtual environment found in: {project_root}")
+    log.info("No virtual environment found for %s", project_root)
     return None, None
 
 
-def sanitize_arguments(args_str):
-    """Validate and sanitize command line arguments to prevent injection."""
-    dangerous_patterns = [';', '&&', '||', '`', '$(', '|', '>', '<']
-    for pattern in dangerous_patterns:
-        if pattern in args_str:
-            raise ValueError(f"Invalid character in arguments: {pattern}")
+def parse_arguments(args_str: str) -> list[str]:
+    """Split a script/pytest argument string into argv items.
 
-    try:
-        parsed_args = shlex.split(args_str)
-        return parsed_args
-    except ValueError as e:
-        raise ValueError(f"Error parsing arguments: {e}")
-
-
-# --- MCP Tools ---
-
-@mcp.tool()
-def connect_remote_debug(host: str = "localhost", port: int = 4444,
-                          timeout: int = 30, caveman_mode: bool = False) -> str:
-    """Connect to a remote PDB session listening on a TCP socket.
-
-    Success is defined as "TCP connection established".  The tool does NOT
-    wait for an initial ``(Pdb)`` prompt because the primary use case —
-    attaching via ``rpdb`` to a script that has not yet reached a
-    breakpoint — has no prompt to wait for.  Any output already buffered on
-    the socket is best-effort drained over ~100 ms and returned.  Once the
-    remote process reaches a prompt, subsequent ``send_pdb_command`` calls
-    work normally; commands sent before that point queue on the socket and
-    are consumed by PDB when it starts reading.
-
-    Works with both:
-    - ``rpdb script.py`` (DualPdb accepts the socket **before** starting
-      the script — no prompt exists until a breakpoint fires)
-    - ``remote_pdb.RemotePdb().set_trace()`` (process is already paused —
-      the prompt is usually immediately available)
-
-    Args:
-        host:    Hostname or IP address of the remote machine (default "localhost").
-        port:    TCP port the remote PDB is listening on (default 4444).
-        timeout: Seconds to wait for a successful TCP connection, retrying on
-                 ConnectionRefused (default 30).  Set to 0 for a single attempt.
-        caveman_mode: Opt-in compact output mode (default False).  When True:
-                 skips the 11-line source window after navigation, omits dir()
-                 in examine_variable unless include_attrs=True, and strips bare
-                 (Pdb) prompts.  Use to reduce token usage when the agent
-                 doesn't need the full context.
+    The subprocess is launched with an argv list (no shell), so shell
+    metacharacters such as ``|`` or ``>`` are passed through literally and
+    are harmless; only quoting needs to be valid.
     """
-    globals()['caveman_mode'] = caveman_mode  # set module-level flag from param
-    global pdb_running, remote_socket, remote_mode
-    global remote_host, remote_port, output_thread, pdb_output_queue
-
-    if pdb_running:
-        if remote_mode:
-            return (
-                f"Already connected to remote PDB at "
-                f"{remote_host}:{remote_port}. Use end_debug first."
-            )
-        else:
-            return (
-                f"Local debugging session already running for "
-                f"{current_file}. Use end_debug first."
-            )
-
-    # Clear the output queue
-    while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
-
-    # Attempt connection, retrying until timeout
-    deadline = time.monotonic() + max(timeout, 0)
-    last_error = None
-    sock = None
-
-    print(f"Connecting to remote PDB at {host}:{port} (timeout={timeout}s)...")
-    while True:
-        try:
-            sock = socket_module.socket(
-                socket_module.AF_INET, socket_module.SOCK_STREAM
-            )
-            sock.settimeout(5.0)
-            sock.connect((host, port))
-            sock.settimeout(None)  # Switch to blocking after connect
-            print(f"Connected to {host}:{port}")
-            break
-        except (ConnectionRefusedError, OSError) as e:
-            last_error = e
-            if sock:
-                try: sock.close()
-                except Exception: pass
-                sock = None
-            if timeout == 0:
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            print(
-                f"Connection refused ({e}), retrying... "
-                f"({remaining:.1f}s remaining)"
-            )
-            time.sleep(min(1.0, remaining))
-
-    if sock is None:
-        return (
-            f"Failed to connect to {host}:{port} within {timeout}s. "
-            f"Last error: {last_error}"
-        )
-
-    # Spawn the reader thread BEFORE we commit any state so that any
-    # exception during setup can tear down cleanly without leaving a
-    # half-initialized session visible to other tools.
-    if output_thread and output_thread.is_alive():
-        print("Warning: Previous output thread was still alive.", file=sys.stderr)
-
-    t = threading.Thread(
-        target=read_socket_output,
-        args=(sock, pdb_output_queue),
-        daemon=True,
-    )
-
     try:
-        t.start()
+        return shlex.split(args_str)
+    except ValueError as e:
+        raise ValueError(f"Error parsing arguments: {e}") from e
 
-        # Best-effort drain: if the remote side is already at a prompt
-        # (e.g. RemotePdb.set_trace()) whatever is buffered arrives in
-        # <100 ms.  A missing prompt is NOT an error — for DualPdb/rpdb
-        # it is the normal case because the script has not started yet.
-        initial_output = get_pdb_output(timeout=0.1)
 
-        # Commit remote state atomically.  pdb_running is set LAST so
-        # any tool guarding on it either sees a fully-configured session
-        # or no session at all — never a partial one.
-        remote_socket = sock
-        remote_mode = True
-        remote_host = host
-        remote_port = port
-        output_thread = t
-        pdb_running = True
+def _resolve_file(file_path: str) -> str | None:
+    cwd = os.getcwd()
+    candidates = [file_path, os.path.join(cwd, file_path)]
+    candidates += [os.path.join(cwd, d, file_path) for d in ("src", "tests", "lib")]
+    for path in candidates:
+        if os.path.exists(path):
+            return os.path.abspath(path)
+    return None
 
-    except Exception as e:
-        # Tear down the reader thread and socket.  We deliberately do NOT
-        # call _clear_remote_state() here — none of the remote_* globals
-        # were committed yet (the commit block above raised before
-        # finishing), so there is nothing to clear.  The module stays in
-        # its pre-call idle state and the caller sees a plain error.
-        try:
-            sock.shutdown(socket_module.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            sock.close()
-        except OSError:
-            pass
-        return (
-            f"Error setting up remote connection: {e}\n"
-            f"{traceback.format_exc()}"
-        )
 
-    if initial_output.strip():
-        return (
-            f"Connected to remote PDB at {host}:{port}\n\n"
-            f"Initial output:\n{initial_output}"
-        )
-    return (
-        f"Connected to remote PDB at {host}:{port}\n\n"
-        "(No prompt yet — the remote process has not reached a breakpoint. "
-        "Commands sent via send_pdb_command will queue on the socket and "
-        "be processed when PDB starts reading.)"
+def _build_command(
+    project_root: str, target: str, use_pytest: bool, parsed_args: list[str]
+) -> tuple[list[str], dict[str, str]] | str:
+    """Return ``(argv, env)`` for the debuggee, or an error message."""
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"  # see program output as it happens
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.pop("PYTHONHOME", None)
+    pytest_flags = ["--pdb", "-s", "--pdbcls=pdb:Pdb"]
+
+    if shutil.which("uv") and os.path.exists(os.path.join(project_root, "pyproject.toml")):
+        log.info("Using uv run in %s", project_root)
+        env.pop("VIRTUAL_ENV", None)  # would point at mcp-pdb's own env
+        tool = ["pytest", *pytest_flags] if use_pytest else ["python", "-m", "pdb"]
+        return ["uv", "run", "--", *tool, target, *parsed_args], env
+
+    venv_python, venv_bin = find_venv_details(project_root)
+    if venv_python and venv_bin:
+        log.info("Using venv Python: %s", venv_python)
+        env["VIRTUAL_ENV"] = os.path.dirname(venv_bin)
+        env["PATH"] = f"{venv_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["PYTHONPATH"] = f"{project_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
+        python_exe = venv_python
+    else:
+        log.warning("No uv project or venv detected; using system Python.")
+        found = shutil.which("python3") or shutil.which("python") or sys.executable
+        if not found:
+            return "Error: Could not find a Python interpreter in PATH."
+        python_exe = found
+
+    if not use_pytest:
+        return [python_exe, "-m", "pdb", target, *parsed_args], env
+    probe = subprocess.run(
+        [python_exe, "-m", "pytest", "--version"],
+        capture_output=True,
+        cwd=project_root,
+        env=env,
+        check=False,
     )
+    if probe.returncode != 0:
+        return f"Error: pytest is not installed for {python_exe}. Cannot run with use_pytest=True."
+    return [python_exe, "-m", "pytest", *pytest_flags, target, *parsed_args], env
+
+
+def _restore_breakpoints() -> str:
+    """Re-send tracked breakpoints belonging to the current project."""
+    todo = [
+        (abs_path, line, data)
+        for abs_path, lines in breakpoints.items()
+        for line, data in lines.items()
+        if data.get("project_root") in (None, current_project_root)
+    ]
+    if not todo:
+        return ""
+    out = ["--- Restoring Breakpoints ---"]
+    for abs_path, line, data in sorted(todo, key=lambda t: (t[0], t[1])):
+        target = f"{_relpath_for_pdb(abs_path)}:{line}"
+        if not os.path.exists(abs_path):
+            out.append(f"{target}: skipped (file no longer exists)")
+            continue
+        data["bp_number"] = None  # pdb numbers afresh in a new process
+        cmd = f"b {target}" + (f", {data['condition']}" if data.get("condition") else "")
+        response = _format_output(
+            [ln for ln in send_to_pdb(cmd).splitlines() if not _is_prompt(ln)]
+        ).strip()
+        out.append(f"{target}: {response or '[no response]'}")
+    return "\n".join(out)
+
+
+# --- MCP tools --------------------------------------------------------------
 
 
 @mcp.tool()
-def start_debug(file_path: str, use_pytest: bool = False, args: str = "",
-                caveman_mode: bool = False) -> str:
-    """Start a debugging session on a Python file within its project context.
+def start_debug(
+    file_path: str, use_pytest: bool = False, args: str = "", caveman_mode: bool = False
+) -> str:
+    """Start a local debugging session on a Python file within its project.
+
+    The runner is picked automatically: ``uv run`` for projects with a
+    pyproject.toml (when uv is installed), else the project's virtualenv,
+    else the system Python.  Breakpoints tracked for this project from
+    earlier sessions are restored.
 
     Args:
         file_path: Path to the Python file or test module to debug.
-        use_pytest: If True, run using pytest with --pdb.
-        args: Additional arguments to pass to the Python script or pytest (space-separated).
-        caveman_mode: Opt-in compact output mode (default False).  When True:
-                      skips the 11-line source window after navigation commands,
-                      omits dir() in examine_variable unless include_attrs=True,
-                      and strips bare (Pdb) prompts from output.  Use to reduce
-                      token usage when the agent doesn't need the full context.
+        use_pytest: If True, run under ``pytest --pdb`` (stops at the first failure).
+        args: Extra arguments for the script or pytest, shell-quoted
+              (e.g. ``-k "test_a or test_b" -x``).
+        caveman_mode: Compact output (default False).  When True: no source
+              window after navigation commands, no dir() listing in
+              examine_variable unless include_attrs=True, and bare (Pdb)
+              prompts stripped.  Persists across restart_debug.
     """
-    globals()['caveman_mode'] = caveman_mode  # set module-level flag from param
-    global pdb_process, pdb_running, current_file, current_project_root, output_thread
-    global pdb_output_queue, breakpoints, current_args, current_use_pytest
+    global pdb_process, pdb_running, at_prompt, current_file, current_project_root
+    global output_thread, current_args, current_use_pytest, stream_eof
 
-    if pdb_running:
-        # Check if the process is *really* still running
-        if pdb_process and pdb_process.poll() is None:
-            return f"Debugging session already running for {current_file}. Use restart_debug or end_debug first."
-        else:
-            print("Detected stale 'pdb_running' state. Resetting.")
-            pdb_running = False # Reset state if process died
+    if pdb_running and _session_alive():
+        where = f"{remote_host}:{remote_port}" if remote_mode else current_file
+        return f"Debugging session already running for {where}. Use restart_debug or end_debug first."
+    if remote_mode:
+        end_debug()
+    pdb_running = False
+    _set_caveman(caveman_mode)
 
-    # --- Validate Input and Find Project ---
-    # Try multiple potential locations for the file
-    paths_to_check = [
-        file_path,                              # As provided
-        os.path.abspath(file_path),             # Absolute path
-        os.path.join(os.getcwd(), file_path),   # Relative to CWD
-    ]
-
-    # Add common directories to search in
-    for common_dir in ["src", "tests", "lib"]:
-        paths_to_check.append(os.path.join(os.getcwd(), common_dir, file_path))
-
-    # Check all possible paths
-    abs_file_path = None
-    for path in paths_to_check:
-        if os.path.exists(path):
-            abs_file_path = path
-            break
-
+    abs_file_path = _resolve_file(file_path)
     if not abs_file_path:
-        return f"Error: File not found at '{file_path}' (checked multiple locations including CWD, src/, tests/, lib/)"
+        return f"Error: File not found at '{file_path}' (checked as given, and under CWD, src/, tests/, lib/)."
 
-    file_dir = os.path.dirname(abs_file_path)
-    project_root = find_project_root(file_dir)
+    project_root = find_project_root(os.path.dirname(abs_file_path))
+    try:
+        parsed_args = parse_arguments(args)
+    except ValueError as e:
+        return f"Error in arguments: {e}"
 
-    # --- Update Global State ---
     current_project_root = project_root
     current_file = abs_file_path
     current_args = args
     current_use_pytest = use_pytest
+    target = _relpath_for_pdb(abs_file_path)
 
-    # Store original working directory before changing
-    original_working_dir = os.getcwd()
-    print(f"Original working directory: {original_working_dir}")
+    built = _build_command(project_root, target, use_pytest, parsed_args)
+    if isinstance(built, str):
+        return built
+    cmd, env = built
+    cmd_str = " ".join(map(shlex.quote, cmd))
+    log.info("Executing: %s (cwd=%s)", cmd_str, project_root)
 
-    # Initialize breakpoints structure for this file if new
-    if current_file not in breakpoints:
-        breakpoints[current_file] = {}
-
-    # Clear the output queue rigorously
-    while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
-
+    _drain_queue()
+    stream_eof = threading.Event()
     try:
-        # --- Determine Execution Environment ---
-        use_uv = False
-        uv_path = shutil.which("uv")
-        venv_python_path = None
-        venv_bin_dir = None
-
-        if uv_path and os.path.exists(os.path.join(project_root, "pyproject.toml")):
-            # More reliably check for uv.lock as primary indicator
-            if os.path.exists(os.path.join(project_root, "uv.lock")):
-                 print("Found uv.lock, assuming uv project.")
-                 use_uv = True
-            else:
-                 # Optional: Could check pyproject.toml for [tool.uv]
-                 print("Found pyproject.toml and uv executable, tentatively trying uv.")
-                 # We'll let `uv run` determine if it's actually a uv project.
-                 use_uv = True # Tentatively true
-
-        if not use_uv:
-            # Look for a standard venv if uv isn't detected/used
-            venv_python_path, venv_bin_dir = find_venv_details(project_root)
-
-        # --- Prepare Command and Subprocess Environment ---
-        cmd = []
-        # Start with a clean environment copy, modify selectively
-        env = os.environ.copy()
-
-        # Calculate relative path from project root (preferred for tools)
-        try:
-            rel_file_path = os.path.relpath(abs_file_path, project_root)
-            # Handle edge case where file is the project root itself (e.g., debugging a script there)
-            if rel_file_path == '.':
-                rel_file_path = os.path.basename(abs_file_path)
-
-        except ValueError:
-             # Handle cases where file is on a different drive (Windows)
-             print(f"Warning: File '{abs_file_path}' not relative to project root '{project_root}'. Using absolute path.")
-             rel_file_path = abs_file_path # Use absolute path if relative fails
-
-
-        # Safely parse arguments using sanitize_arguments
-        try:
-            parsed_args = sanitize_arguments(args)
-        except ValueError as e:
-            return f"Error in arguments: {e}"
-
-        # Determine command based on environment
-        if use_uv:
-            print(f"Using uv run in: {project_root}")
-            # Clean potentially conflicting env vars for uv run
-            env.pop('VIRTUAL_ENV', None)
-            env.pop('PYTHONHOME', None)
-            base_cmd = ["uv", "run", "--"]
-            if use_pytest:
-                # -s: show stdout/stderr, --pdbcls: use standard pdb
-                base_cmd.extend(["pytest", "--pdb", "-s", "--pdbcls=pdb:Pdb"])
-            else:
-                base_cmd.extend(["python", "-m", "pdb"])
-            cmd = base_cmd + [rel_file_path] + parsed_args
-        elif venv_python_path:
-            print(f"Using venv Python: {venv_python_path}")
-            # find_venv_details returns (python_path, bin_dir) as a pair;
-            # venv_bin_dir is non-None whenever venv_python_path is non-None.
-            assert venv_bin_dir is not None
-            venv_dir = os.path.dirname(os.path.dirname(venv_bin_dir)) # Get actual venv root
-            env['VIRTUAL_ENV'] = venv_dir
-            env['PATH'] = f"{venv_bin_dir}{os.pathsep}{env.get('PATH', '')}"
-            env.pop('PYTHONHOME', None)
-
-            # Critical addition: Set PYTHONPATH to include project root
-            env['PYTHONPATH'] = f"{project_root}{os.pathsep}{env.get('PYTHONPATH', '')}"
-
-            # Force unbuffered output for better debugging experience
-            env['PYTHONUNBUFFERED'] = '1'
-
-            if use_pytest:
-                # Find pytest within the venv
-                pytest_exe = os.path.join(venv_bin_dir, 'pytest' + ('.exe' if sys.platform == 'win32' else ''))
-                if not os.path.exists(pytest_exe):
-                    # Try finding via the venv python itself
-                    try:
-                        result = subprocess.run([venv_python_path, "-m", "pytest", "--version"], capture_output=True, text=True, check=True, cwd=project_root, env=env)
-                        print(f"Found pytest via '{venv_python_path} -m pytest'")
-                        cmd = [venv_python_path, "-m", "pytest", "--pdb", "-s", "--pdbcls=pdb:Pdb", rel_file_path] + parsed_args
-                    except (subprocess.CalledProcessError, FileNotFoundError):
-                         return f"Error: pytest not found or executable in the virtual environment at {venv_bin_dir}. Cannot run with --pytest."
-                else:
-                    cmd = [pytest_exe, "--pdb", "-s", "--pdbcls=pdb:Pdb", rel_file_path] + parsed_args
-            else:
-                cmd = [venv_python_path, "-m", "pdb", rel_file_path] + parsed_args
-        else:
-            print("Warning: No uv or standard venv detected in project root. Using system Python/pytest.")
-            # Fallback to system python/pytest found in PATH
-            python_exe = shutil.which("python") or sys.executable # Find system python more reliably
-            if not python_exe:
-                 return "Error: Could not find 'python' executable in system PATH."
-
-            if use_pytest:
-                 pytest_exe = shutil.which("pytest")
-                 if not pytest_exe:
-                     return "Error: pytest command not found in system PATH. Cannot run with --pytest."
-                 cmd = [pytest_exe, "--pdb", "-s", "--pdbcls=pdb:Pdb", rel_file_path] + parsed_args
-            else:
-                 cmd = [python_exe, "-m", "pdb", rel_file_path] + parsed_args
-
-        # --- Launch Subprocess ---
-        print(f"Executing command: {' '.join(map(shlex.quote, cmd))}")
-        print(f"Working directory: {project_root}")
-        print(f"Using VIRTUAL_ENV: {env.get('VIRTUAL_ENV', 'Not Set')}")
-        # print(f"Using PATH: {env.get('PATH', 'Not Set')}") # Can be very long
-
-        # Ensure previous thread is not running (important for restarts)
-        if output_thread and output_thread.is_alive():
-             print("Warning: Previous output thread was still alive.", file=sys.stderr)
-             # Attempting to join might hang if readline blocks, so we just detach.
-
-        pdb_process = subprocess.Popen(
+        # Own process group: `uv run` spawns python as a grandchild, and
+        # signalling the whole group is the only reliable way to interrupt
+        # or kill the real debuggee.
+        proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, # Merge stderr to stdout for easier capture
-            text=False, # Read bytes for reliable readline behavior
-            cwd=project_root, # <<< CRITICAL: Run from project root
-            env=env,          # Pass the prepared environment
-            bufsize=0         # Use system default buffering (often line-buffered)
+            stderr=subprocess.STDOUT,
+            cwd=project_root,
+            env=env,
+            bufsize=0,
+            start_new_session=sys.platform != "win32",
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
-
-        # Start the output reader thread anew
-        output_thread = threading.Thread(
-            target=read_pdb_output,
-            args=(pdb_process, pdb_output_queue),
-            daemon=True # Allows main program to exit even if thread is running
-        )
-        output_thread.start()
-
-        pdb_running = True # Set running state *before* waiting for output
-
-        # --- Wait for Initial Output & Verify Start ---
-        print("Waiting for PDB to start...")
-        initial_output = get_pdb_output(timeout=3.0) # Longer timeout for potentially slow starts/imports
-
-        # Check if process died immediately
-        if pdb_process.poll() is not None:
-             exit_code = pdb_process.poll()
-             pdb_running = False
-             # Attempt to get any remaining output directly if thread missed it
-             final_out_bytes, _ = pdb_process.communicate()
-             final_out_str = final_out_bytes.decode('utf-8', errors='replace')
-             full_output = initial_output + "\n" + final_out_str.strip()
-             return (f"Error: PDB process exited immediately (Code: {exit_code}). "
-                     f"Command: {' '.join(map(shlex.quote, cmd))}\n"
-                     f"Working Dir: {project_root}\n"
-                     f"Output:\n---\n{full_output}\n---")
-
-        # Check for typical PDB prompt indicators
-        # Needs to be somewhat lenient as initial output varies (e.g., pytest header)
-        has_pdb_prompt = "-> " in initial_output or "(Pdb)" in initial_output
-        has_error = "Error:" in initial_output or "Exception:" in initial_output
-
-        if not has_pdb_prompt:
-             # If no prompt but also no obvious error and process is running,
-             # it might be okay, just slower startup or waiting.
-             if pdb_process.poll() is None and not has_error:
-                  warning_msg = ("Warning: PDB started but initial prompt ('-> ' or '(Pdb)') "
-                                 "not detected in first few seconds. It might be running.")
-                  print(warning_msg, file=sys.stderr)
-                  # Proceed but include the warning in the return message
-                  initial_output = f"{warning_msg}\n\n{initial_output}"
-             else:
-                  # No prompt, process might have died silently or has error message
-                  pdb_running = False
-                  # Try to get more output
-                  final_output = get_pdb_output(timeout=0.5)
-                  full_output = initial_output + "\n" + final_output
-                  return (f"Error starting PDB. No prompt detected and process may have issues.\n"
-                           f"Command: {' '.join(map(shlex.quote, cmd))}\n"
-                           f"Working Dir: {project_root}\n"
-                           f"Output:\n---\n{full_output}\n---")
-
-        # --- Restore Breakpoints ---
-        restored_bps_output = ""
-        if current_file in breakpoints and breakpoints[current_file]:
-            print(f"Restoring {len(breakpoints[current_file])} breakpoints for {rel_file_path}...")
-            # Use relative path for consistency in breakpoint commands
-            try:
-                bp_rel_path = os.path.relpath(current_file, project_root)
-                if bp_rel_path == '.': bp_rel_path = os.path.basename(current_file)
-            except ValueError:
-                bp_rel_path = current_file # Fallback
-
-            restored_bps_output += "\n--- Restoring Breakpoints ---\n"
-            # Sort by line number for clarity
-            for line_num in sorted(breakpoints[current_file].keys()):
-                bp_command_rel = f"b {bp_rel_path}:{line_num}"
-                print(f"Sending restore cmd: {bp_command_rel}")
-                restore_out = send_to_pdb(bp_command_rel)
-                restored_bps_output += f"Set {bp_rel_path}:{line_num}: {restore_out or '[No Response]'}\n"
-
-                # Extract and update BP number if available
-                match = re.search(r"Breakpoint (\d+) at", restore_out)
-                if match:
-                    bp_data = breakpoints[current_file][line_num]
-                    if isinstance(bp_data, dict):
-                        bp_data["bp_number"] = match.group(1)
-                    else:
-                        # Backward compatibility with older format
-                        breakpoints[current_file][line_num] = {
-                            "command": bp_data,
-                            "bp_number": match.group(1)
-                        }
-
-            restored_bps_output += "--- Breakpoint Restore Complete ---\n"
-
-        return f"Debugging session started for {rel_file_path} (in {project_root})\n\n{initial_output}\n{restored_bps_output}"
-
     except FileNotFoundError as e:
-         pdb_running = False
-         return (
-             f"Error starting debugging session: Command not found "
-             f"({e.filename}). Check that the required executable is "
-             f"installed and in PATH (system or venv).\n{traceback.format_exc()}"
-         )
+        return f"Error starting debugging session: command not found ({e.filename}). Command: {cmd_str}"
     except Exception as e:
-        pdb_running = False
-        return f"Error starting debugging session: {str(e)}\n{traceback.format_exc()}"
+        return f"Error starting debugging session: {e}\n{traceback.format_exc()}"
+    pdb_process = proc
+
+    output_thread = threading.Thread(
+        target=read_pdb_output, args=(proc, pdb_output_queue, stream_eof), daemon=True
+    )
+    output_thread.start()
+    pdb_running = True
+
+    lines, saw_prompt = _collect_output(STARTUP_TIMEOUT)
+    at_prompt = saw_prompt
+    initial_output = _format_output(lines)
+
+    if not saw_prompt:
+        if not _is_local_process_alive():
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=1.0)
+            rest = _format_output(_drain_queue())
+            pdb_running = False
+            hint = ""
+            if use_pytest:
+                hint = "\n(Under pytest --pdb, pdb only opens on a failure or error; if every test passed there is nothing to debug.)"
+            return (
+                f"Error: PDB process exited before reaching a prompt (code {proc.returncode}).\n"
+                f"Command: {cmd_str}\nWorking dir: {project_root}\n"
+                f"Output:\n---\n{_truncate(initial_output + rest)}\n---{hint}"
+            )
+        initial_output += (
+            f"\n\n[Warning: no (Pdb) prompt within {STARTUP_TIMEOUT:g}s; the "
+            "program is still running. Use get_output to wait for it.]"
+        )
+
+    restored = ""
+    if saw_prompt:
+        if not use_pytest:  # pytest turns SIGINT into its own pdb entry
+            send_to_pdb(_SKIP_INTERNALS_CMD)
+        restored = _restore_breakpoints()
+    return _truncate(
+        f"Debugging session started for {target} (in {project_root})\n\n"
+        f"{initial_output}\n{restored}"
+    ).rstrip()
+
 
 @mcp.tool()
-def send_pdb_command(command: str) -> str:
+def connect_remote_debug(
+    host: str = "localhost", port: int = 4444, timeout: int = 30, caveman_mode: bool = False
+) -> str:
+    """Connect to a remote PDB session listening on a TCP socket.
+
+    Success means "TCP connection established": the tool does not wait for
+    a ``(Pdb)`` prompt, because with ``rpdb script.py`` the script only
+    starts once the client connects.  Commands sent before the remote side
+    reaches a prompt queue on the socket.
+
+    Works with ``rpdb script.py`` (dual terminal + agent session) and
+    ``remote_pdb.RemotePdb().set_trace()``.
+
+    Args:
+        host: Hostname or IP of the remote pdb (default "localhost").
+        port: TCP port the remote pdb listens on (default 4444).
+        timeout: Seconds to keep retrying a refused connection (default 30;
+                 0 for a single attempt).
+        caveman_mode: Compact output mode; see start_debug.
+    """
+    global pdb_running, remote_socket, remote_mode, remote_host, remote_port
+    global output_thread, stream_eof, at_prompt
+
+    if pdb_running and _session_alive():
+        if remote_mode:
+            return f"Already connected to remote PDB at {remote_host}:{remote_port}. Use end_debug first."
+        return f"Local debugging session already running for {current_file}. Use end_debug first."
+    if pdb_process is not None:
+        end_debug()
+    pdb_running = False
+    _set_caveman(caveman_mode)
+    _drain_queue()
+
+    deadline = time.monotonic() + max(timeout, 0)
+    last_error: OSError | None = None
+    sock = None
+    log.info("Connecting to remote PDB at %s:%s (timeout=%ss)", host, port, timeout)
+    while True:
+        try:
+            sock = socket_module.create_connection((host, port), timeout=5.0)
+            sock.settimeout(None)
+            break
+        except OSError as e:
+            last_error = e
+            remaining = deadline - time.monotonic()
+            if timeout == 0 or remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+
+    if sock is None:
+        return f"Failed to connect to {host}:{port} within {timeout}s. Last error: {last_error}"
+
+    stream_eof = threading.Event()
+    t = threading.Thread(
+        target=read_socket_output, args=(sock, pdb_output_queue, stream_eof), daemon=True
+    )
+    try:
+        t.start()
+        # Best effort: a RemotePdb.set_trace() target is already at a prompt.
+        lines, saw_prompt = _collect_output(0.3)
+    except Exception as e:
+        _close_socket(sock)
+        return f"Error setting up remote connection: {e}\n{traceback.format_exc()}"
+
+    # Commit state; pdb_running last so no tool sees a half-built session.
+    remote_socket = sock
+    remote_mode = True
+    remote_host = host
+    remote_port = port
+    output_thread = t
+    at_prompt = saw_prompt
+    pdb_running = True
+
+    initial_output = _format_output(lines)
+    if initial_output.strip():
+        return f"Connected to remote PDB at {host}:{port}\n\nInitial output:\n{initial_output}"
+    return (
+        f"Connected to remote PDB at {host}:{port}\n\n"
+        "(No prompt yet - the remote process has not reached a breakpoint. "
+        "Commands sent via send_pdb_command will queue on the socket and be "
+        "processed when PDB starts reading; get_output waits for the prompt.)"
+    )
+
+
+@mcp.tool()
+def send_pdb_command(command: str, timeout: float | None = None) -> str:
     """Send a command to the running PDB instance.
 
+    Returns as soon as pdb shows its next prompt.  If the program is still
+    running when the timeout expires, the partial output is returned with a
+    note; call get_output to keep waiting, or interrupt to pause it.
+
     Examples:
-        n (next line), c (continue), s (step into), r (return from function)
-        p variable (print variable), pp variable (pretty print)
-        b line_num (set breakpoint in current file), b file:line_num
-        cl num (clear breakpoint number), cl file:line_num
-        l (list source code), ll (list longer source code)
-        a (print arguments of current function)
-        q (quit)
+        n (next), s (step into), c (continue), r (return), unt 42 (run to line 42)
+        p expr, pp expr, w (stack), u / d (move up/down the stack)
+        b 42, b file.py:42, b func, b 42, x > 3 (conditional), cl 3
+        l / ll (list source), a (function args), q (quit)
+
+    Breakpoints set or cleared here are tracked and restored on restart.
 
     Args:
         command: The PDB command string.
+        timeout: Max seconds to wait for the prompt.  Default 30 for commands
+                 that run code (c, r, unt, ...), 10 otherwise.
     """
-    global pdb_running, pdb_process, remote_socket, remote_mode
-
+    global pdb_running
     if not pdb_running:
-        return (
-            "No active debugging session. "
-            "Use start_debug or connect_remote_debug first."
-        )
+        return NO_SESSION_MSG
+    if "\n" in command.strip():
+        return "Error: send one command per call (no newlines). Use ';;' to chain pdb commands."
 
-    # Double check connection liveness
-    if remote_mode:
-        if not _is_remote_connected():
-            pdb_running = False
-            return "Remote debugging connection closed."
-    else:
-        if pdb_process is None or pdb_process.poll() is not None:
-            pdb_running = False
-            final_output = get_pdb_output(timeout=0.1)
-            return f"The debugging session appears to have ended.\nFinal Output:\n{final_output}"
-
-    try:
-        # Determine appropriate timeout based on command complexity
-        timeout_multiplier = 1.0
-        if command.strip().lower() in ('c', 'continue', 'r', 'run'):
-            # These commands might take longer to complete
-            timeout_multiplier = 2.0
-
-        response = send_to_pdb(command, timeout_multiplier)
-
-        # Check if the session ended after this specific command (e.g., 'q' or fatal error)
-        if not pdb_running: # send_to_pdb might set this if process ended
-             return f"Command output:\n{response}" # Response already includes end notice
-
-        # In verbose mode, fetch 11-line source context after navigation commands
-        if not caveman_mode:
-            nav_commands = ['n', 's', 'c', 'r', 'unt', 'until', 'next', 'step', 'continue', 'return']
-            if command.strip().lower() in nav_commands and pdb_running:
-                still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
-                if still_active:
-                    line_context = send_to_pdb("l .")
-                    still_active2 = _is_remote_connected() if remote_mode else _is_local_process_alive()
-                    if pdb_running and still_active2:
-                        response += f"\n\n-- Current location --\n{line_context}"
-                    else:
-                        response += "\n\n-- Session ended after navigation --"
-                        pdb_running = False
-
+    response = send_to_pdb(command, timeout)
+    if not pdb_running:
         return f"Command output:\n{response}"
 
-    except Exception as e:
-        # Catch unexpected errors during command sending/processing
-        print(f"Error in send_pdb_command: {e}", file=sys.stderr)
-        # Check connection status again
-        still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
-        if not still_active:
-             pdb_running = False
-             return (f"Error sending command: {str(e)}\n\n"
-                     "*** The debugging session has likely ended. ***\n"
-                     f"{traceback.format_exc()}")
+    if not caveman_mode and at_prompt and _command_word(command) in NAV_COMMANDS:
+        context = send_to_pdb("l .")
+        if pdb_running:
+            response += f"\n\n-- Current location --\n{context}"
         else:
-             return f"Error sending command: {str(e)}\n{traceback.format_exc()}"
+            response += f"\n\n-- Session ended after navigation --\n{context}"
+
+    return f"Command output:\n{response}"
 
 
 @mcp.tool()
-def set_breakpoint(file_path: str, line_number: int) -> str:
-    """Set a breakpoint at a specific line in a file. Uses relative path if possible.
+def get_output(timeout: float = 10.0) -> str:
+    """Wait for more output from the debuggee without sending a command.
+
+    Use after a command returned "still running", or for a remote session
+    that has not reached a breakpoint yet.  Returns when pdb prints its
+    prompt, the program exits, or ``timeout`` seconds pass.
+    """
+    global pdb_running, at_prompt
+    if not pdb_running:
+        return NO_SESSION_MSG
+    lines, saw_prompt = _collect_output(timeout)
+    _sync_breakpoints("\n".join(lines))
+    if lines:
+        at_prompt = saw_prompt
+    output = _format_output(lines)
+    if not _session_alive():
+        output += "\n" + _format_output(_drain_queue())
+        pdb_running = False
+        return _truncate(output) + _session_ended_notice()
+    if at_prompt:
+        status = "[At (Pdb) prompt]"
+    else:
+        status = f"[Still running after {timeout:g}s - no prompt yet]"
+    return _truncate(f"{output}\n{status}" if output.strip() else status)
+
+
+@mcp.tool()
+def interrupt() -> str:
+    """Pause a running program (like pressing Ctrl+C) and return to the prompt.
+
+    Local sessions only.  Under ``python -m pdb`` this stops at the line
+    currently executing; under pytest it raises KeyboardInterrupt in the test.
+    """
+    if not pdb_running:
+        return NO_SESSION_MSG
+    if remote_mode:
+        return "interrupt is not supported for remote sessions; press Ctrl+C in the remote process's terminal."
+    if at_prompt:
+        return "Already at the (Pdb) prompt; nothing to interrupt."
+    assert pdb_process is not None
+    if not _signal_group(pdb_process, signal.SIGINT):
+        return "Could not signal the debuggee (it may have exited)."
+    return "Sent interrupt.\n" + get_output(timeout=5.0)
+
+
+@mcp.tool()
+def set_breakpoint(file_path: str, line_number: int, condition: str = "") -> str:
+    """Set a breakpoint at a line, optionally conditional. Tracked across restarts.
 
     Args:
-        file_path: Path to the file (can be relative to project root or absolute).
+        file_path: Path to the file (relative to the project root, or absolute).
         line_number: Line number for the breakpoint.
+        condition: Optional Python expression; pdb stops only when it is true
+                   (e.g. ``i == 99`` or ``user is None``).
     """
-    global breakpoints, current_project_root
-
     if not pdb_running:
-        return (
-            "No active debugging session. "
-            "Use start_debug or connect_remote_debug first."
-        )
-    if not current_project_root:
-         return "Error: Project root not identified. Cannot reliably set breakpoint."
-
-    abs_file_path = os.path.abspath(os.path.join(current_project_root, file_path)) # Resolve relative to root first
-    if not os.path.exists(abs_file_path):
-        abs_file_path = os.path.abspath(file_path) # Try absolute directly
-        if not os.path.exists(abs_file_path):
-             return f"Error: File not found at '{file_path}' (checked relative to project and absolute)."
-
-    # Use relative path for the breakpoint command if possible
-    try:
-        rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
-    except ValueError:
-        rel_file_path = abs_file_path # Fallback to absolute
-
-    # Track breakpoints using the *absolute* path as the key for internal consistency
-    if abs_file_path not in breakpoints:
-        breakpoints[abs_file_path] = {}
-
-    if line_number in breakpoints[abs_file_path]:
-        # Verify with pdb if it's actually set there
-        current_bps = send_to_pdb("b")
-        if f"{rel_file_path}:{line_number}" in current_bps:
-             return f"Breakpoint already exists and is tracked at {abs_file_path}:{line_number}"
-        else:
-             print(f"Warning: Breakpoint tracked locally but not found in PDB output for {rel_file_path}:{line_number}. Will attempt to set.")
-
-
-    command = f"b {rel_file_path}:{line_number}"
-    response = send_to_pdb(command)
-
-    # More robust verification using pattern matching
-    bp_markers = ["Breakpoint", "at", str(line_number)]
-    if all(marker in response for marker in bp_markers):
-        # Extract breakpoint number from response
-        match = re.search(r"Breakpoint (\d+) at", response)
-        bp_number = match.group(1) if match else None
-
-        # Store both command and breakpoint number
-        breakpoints[abs_file_path][line_number] = {
-            "command": command,
-            "bp_number": bp_number
-        }
-        return f"Breakpoint #{bp_number} set and tracked:\n{response}"
-    elif "Error" not in response and "multiple files" not in response.lower():
-         # Maybe pdb didn't confirm explicitly but didn't error? (e.g., line doesn't exist yet)
-         # We won't track it reliably unless PDB confirms it.
-         return f"Breakpoint command sent. PDB response might indicate an issue (e.g., invalid line) or success without standard confirmation:\n{response}\n(Breakpoint NOT reliably tracked. Verify with list_breakpoints)"
+        return NO_SESSION_MSG
+    if remote_mode:
+        target = f"{file_path}:{line_number}"
     else:
-        # PDB reported an error or ambiguity
+        root = current_project_root or os.getcwd()
+        abs_file_path = os.path.abspath(os.path.join(root, file_path))
+        if not os.path.exists(abs_file_path):
+            return f"Error: File not found at '{file_path}' (checked relative to {root} and as absolute)."
+        target = f"{_relpath_for_pdb(abs_file_path)}:{line_number}"
+
+    condition = condition.strip()
+    response = send_to_pdb(f"b {target}" + (f", {condition}" if condition else ""))
+    match = _BP_SET_RE.search(response)
+    if not match:
         return f"Failed to set breakpoint. PDB response:\n{response}"
+    if condition and not remote_mode:
+        breakpoints[os.path.abspath(match.group(2))][int(match.group(3))]["condition"] = condition
+    return f"Breakpoint #{match.group(1)} set{' (if ' + condition + ')' if condition else ''}:\n{response}"
 
 
 @mcp.tool()
 def clear_breakpoint(file_path: str, line_number: int) -> str:
-    """Clear a breakpoint at a specific line in a file. Uses relative path if possible.
+    """Clear the breakpoint(s) at a specific line in a file.
 
     Args:
         file_path: Path to the file where the breakpoint exists.
         line_number: Line number of the breakpoint to clear.
     """
-    global breakpoints, current_project_root
-
     if not pdb_running:
-        return (
-            "No active debugging session. "
-            "Use start_debug or connect_remote_debug first."
-        )
-    if not current_project_root:
-         return "Error: Project root not identified. Cannot reliably clear breakpoint."
-
-    abs_file_path = os.path.abspath(os.path.join(current_project_root, file_path))
-    if not os.path.exists(abs_file_path):
-        abs_file_path = os.path.abspath(file_path)
-        if not os.path.exists(abs_file_path):
-             # If file doesn't exist, we likely don't have a BP anyway
-             if abs_file_path in breakpoints and line_number in breakpoints[abs_file_path]:
-                  del breakpoints[abs_file_path][line_number]
-                  if not breakpoints[abs_file_path]: del breakpoints[abs_file_path]
-             return f"Warning: File not found at '{file_path}'. Breakpoint untracked (if it was tracked)."
-
-
-    try:
-        rel_file_path = os.path.relpath(abs_file_path, current_project_root)
-        if rel_file_path == '.': rel_file_path = os.path.basename(abs_file_path)
-    except ValueError:
-        rel_file_path = abs_file_path
-
-    # Check if we have a breakpoint number stored, which is more reliable for clearing
-    bp_number = None
-    if abs_file_path in breakpoints and line_number in breakpoints[abs_file_path]:
-        bp_data = breakpoints[abs_file_path][line_number]
-        if isinstance(bp_data, dict) and "bp_number" in bp_data:
-            bp_number = bp_data["bp_number"]
-
-    # Use the breakpoint number if available, otherwise use file:line
-    if bp_number:
-        command = f"cl {bp_number}"
+        return NO_SESSION_MSG
+    abs_file_path = None
+    if remote_mode:
+        target = f"{file_path}:{line_number}"
     else:
-        command = f"cl {rel_file_path}:{line_number}"
+        root = current_project_root or os.getcwd()
+        abs_file_path = os.path.abspath(os.path.join(root, file_path))
+        target = f"{_relpath_for_pdb(abs_file_path)}:{line_number}"
 
-    response = send_to_pdb(command)
-
-    # Check response for confirmation (e.g., "Deleted breakpoint", "No breakpoint")
-    breakpoint_cleared_in_pdb = "Deleted breakpoint" in response or "No breakpoint" in response or "Error: " not in response
-
-    # Update internal tracking
-    if abs_file_path in breakpoints and line_number in breakpoints[abs_file_path]:
-        if breakpoint_cleared_in_pdb:
-            del breakpoints[abs_file_path][line_number]
-            if not breakpoints[abs_file_path]: # Remove file entry if no more bps
-                 del breakpoints[abs_file_path]
-            status_msg = "Breakpoint untracked."
-        else:
-            status_msg = "Breakpoint potentially still exists in PDB despite local tracking. Verify with list_breakpoints."
-    else:
-        status_msg = "Breakpoint was not tracked locally."
-
-
-    return f"Clear breakpoint result:\n{response}\n({status_msg})"
+    response = send_to_pdb(f"cl {target}")
+    if "Deleted breakpoint" in response:
+        return f"Breakpoint cleared:\n{response}"
+    if abs_file_path and "There is no breakpoint at" in response:
+        # pdb has none there; drop any stale tracking so restarts agree.
+        file_bps = breakpoints.get(abs_file_path, {})
+        if file_bps.pop(line_number, None) is not None and not file_bps:
+            breakpoints.pop(abs_file_path, None)
+    return f"No breakpoint cleared. PDB response:\n{response}"
 
 
 @mcp.tool()
 def list_breakpoints() -> str:
-    """List breakpoints known by PDB and compare with internally tracked breakpoints."""
-    global breakpoints, current_project_root
-
+    """List breakpoints known to PDB alongside those tracked for restarts."""
+    tracked = _format_tracked_breakpoints()
+    tracked_text = "\n".join(tracked) if tracked else "None"
     if not pdb_running:
-        return (
-            "No active debugging session. "
-            "Use start_debug or connect_remote_debug first."
-        )
-    if not current_project_root:
-        # List only tracked BPs if PDB isn't running or root unknown
-        tracked_bps_formatted = []
-        for abs_path, lines in breakpoints.items():
-             # Try to show relative if possible, else absolute
-            try:
-                disp_path = os.path.relpath(abs_path, os.getcwd()) # Relative to current dir might be useful
-            except ValueError:
-                disp_path = abs_path
-            for line_num in sorted(lines.keys()):
-                bp_data = lines[line_num]
-                if isinstance(bp_data, dict) and "bp_number" in bp_data:
-                    tracked_bps_formatted.append(f"{disp_path}:{line_num} (BP #{bp_data['bp_number']})")
-                else:
-                    tracked_bps_formatted.append(f"{disp_path}:{line_num}")
-        return "No active PDB session or project root unknown.\n\n--- Tracked Breakpoints ---\n" + ('\n'.join(tracked_bps_formatted) if tracked_bps_formatted else "None")
-
-
+        return f"No active PDB session.\n\n--- Tracked Breakpoints ---\n{tracked_text}"
     pdb_response = send_to_pdb("b")
+    return (
+        f"--- PDB Breakpoints ---\n{pdb_response}\n\n"
+        f"--- Tracked Breakpoints (restored on restart) ---\n{tracked_text}"
+    )
 
-    # Format our tracked breakpoints using relative paths from project root where possible
-    tracked_bps_formatted = []
-    for abs_path, lines in breakpoints.items():
-        try:
-            rel_path = os.path.relpath(abs_path, current_project_root)
-            if rel_path == '.': rel_path = os.path.basename(abs_path)
-        except ValueError:
-            rel_path = abs_path # Fallback if not relative
-        for line_num in sorted(lines.keys()):
-            bp_data = lines[line_num]
-            if isinstance(bp_data, dict) and "bp_number" in bp_data:
-                tracked_bps_formatted.append(f"{rel_path}:{line_num} (BP #{bp_data['bp_number']})")
-            else:
-                tracked_bps_formatted.append(f"{rel_path}:{line_num}")
-
-    # Add a comparison note
-    comparison_note = "\n(Compare PDB list above with tracked list below. Use set/clear to synchronize if needed.)"
-
-    return (f"--- PDB Breakpoints ---\n{pdb_response}\n\n"
-            f"--- Tracked Breakpoints ---\n" +
-            ('\n'.join(tracked_bps_formatted) if tracked_bps_formatted else "None") +
-            comparison_note)
 
 @mcp.tool()
 def restart_debug() -> str:
-    """Restart the debugging session with the same file/connection, arguments, and pytest flag.
+    """Restart the session with the same file/args/pytest flag (or reconnect remote).
 
-    For remote sessions: reconnects to the same host and port.
-    For local sessions: relaunches the same file with the same arguments.
+    Tracked breakpoints - in any file of the project - are restored, and
+    caveman_mode is preserved.
     """
-    global pdb_process, pdb_running, current_file, current_args, current_use_pytest
-    global remote_mode, remote_host, remote_port
-
+    keep_caveman = caveman_mode
     if remote_mode:
-        # Remote restart: close current connection and reconnect
-        stored_host = remote_host
-        stored_port = remote_port
-        if not stored_host:
-            return "No remote session was previously started to restart."
-
-        print(f"Attempting to reconnect to remote PDB at {stored_host}:{stored_port}...")
+        host, port = remote_host, remote_port
         end_result = end_debug()
-        reconnect_result = connect_remote_debug(host=stored_host, port=stored_port)
-        return (f"--- Remote Restart Attempt ---\n"
-                f"Previous session end result: {end_result}\n\n"
-                f"Reconnection status:\n{reconnect_result}")
+        reconnect = connect_remote_debug(host=host, port=port, caveman_mode=keep_caveman)
+        return f"--- Remote Restart ---\nPrevious session: {end_result}\n\n{reconnect}"
 
-    # Local restart
     if not current_file:
-        return "No debugging session was previously started (or state lost) to restart."
+        return "No debugging session was previously started to restart."
+    file_to_debug, args_to_use, use_pytest = current_file, current_args, current_use_pytest
+    end_result = end_debug() if pdb_running or _is_local_process_alive() else "Previous session had already ended."
+    start_result = start_debug(
+        file_path=file_to_debug, use_pytest=use_pytest, args=args_to_use, caveman_mode=keep_caveman
+    )
+    return f"--- Restart ---\nPrevious session: {end_result}\n\n{start_result}"
 
-    # Store details before ending the current session
-    file_to_debug = current_file
-    args_to_use = current_args
-    use_pytest_flag = current_use_pytest
-    print(f"Attempting to restart debug for: {file_to_debug} with args='{args_to_use}' pytest={use_pytest_flag}")
 
-    # End the current session forcefully if running
-    end_result = "Previous session not running or already ended."
-    if pdb_running:
-        print("Ending current session before restart...")
-        end_result = end_debug() # Use the dedicated end function
-        print(f"Restart: {end_result}")
+_EXAMINE_CODE = """\
+import pprint
+def _cut(s):
+    return s if len(s) <= MAX else s[:MAX] + f'... [truncated; {len(s)} chars total]'
+t = type(_v)
+print('Type:', t.__qualname__ if t.__module__ == 'builtins' else t.__module__ + '.' + t.__qualname__)
+try:
+    print('Len:', len(_v))
+except Exception:
+    pass
+try:
+    r = repr(_v)
+except Exception as e:
+    r = None
+    print('Value: <repr() failed: %r>' % (e,))
+if r is not None:
+    print('Value:', _cut(r))
+    if PRETTY:
+        p = pprint.pformat(_v, width=100)
+        if p != r:
+            print('Pretty:')
+            print(_cut(p))
+if ATTRS:
+    names = dir(_v)
+    public = [n for n in names if not n.startswith('__')]
+    print('Attrs:', _cut(repr(public)), '(+%d dunder)' % (len(names) - len(public)))
+"""
 
-    # Reset state explicitly (end_debug should handle most, but belt-and-suspenders)
-    pdb_process = None
-    pdb_running = False
-    # output_thread should be handled by new start_debug call
 
-    # Clear the output queue again just in case
-    while not pdb_output_queue.empty():
-       try: pdb_output_queue.get_nowait()
-       except queue.Empty: break
+def _examine_command(expr: str, pretty: bool, attrs: bool, max_chars: int) -> str:
+    """Build one pdb line that reports on ``expr`` without touching the frame.
 
-    # Start a new session using stored parameters
-    print("Calling start_debug for restart...")
-    start_result = start_debug(file_path=file_to_debug, use_pytest=use_pytest_flag, args=args_to_use)
-
-    # Note: Breakpoints are now restored within start_debug using the tracked 'breakpoints' dict
-
-    return f"--- Restart Attempt ---\nPrevious session end result: {end_result}\n\nNew session status:\n{start_result}"
+    ``expr`` is evaluated once, in the current frame, and handed to helper
+    code running in a throwaway namespace, so no names leak into the
+    program being debugged.
+    """
+    code = (
+        _EXAMINE_CODE.replace("MAX", str(max(int(max_chars), 100)))
+        .replace("PRETTY", str(pretty))
+        .replace("ATTRS", str(attrs))
+    )
+    return f"!__import__('builtins').exec({code!r}, {{'_v': ({expr})}})"
 
 
 @mcp.tool()
-def examine_variable(variable_name: str, include_attrs: bool = False) -> str:
-    """Examine a variable's value and type using PDB.
+def examine_variable(variable_name: str, include_attrs: bool = False, max_chars: int = 4000) -> str:
+    """Examine a variable or expression: type, length, value and (optionally) attributes.
+
+    One round-trip; the expression is evaluated once in the current frame.
 
     Args:
-        variable_name: Name of the variable to examine (e.g., 'my_var', 'self.data').
-        include_attrs: If True, also show dir() attribute list. Default False.
-                       Always True when caveman_mode=False.
+        variable_name: Variable or expression (e.g. ``my_var``, ``self.data[0]``).
+        include_attrs: Also list dir() attributes.  Always on when
+                       caveman_mode is False.
+        max_chars: Truncate the repr / pretty-print beyond this many characters.
     """
     if not pdb_running:
-        return (
-            "No active debugging session. "
-            "Use start_debug or connect_remote_debug first."
+        return NO_SESSION_MSG
+    expr = variable_name.strip()
+    if not expr or "\n" in expr:
+        return "Error: variable_name must be a single-line expression."
+    response = send_to_pdb(
+        _examine_command(
+            expr, pretty=not caveman_mode, attrs=include_attrs or not caveman_mode, max_chars=max_chars
         )
-
-    if not caveman_mode:
-        # Verbose path: exact original behaviour
-        p_command = f"p {variable_name}"
-        print(f"Sending command: {p_command}")
-        basic_info = send_to_pdb(p_command)
-        if not pdb_running: return f"Session ended after 'p {variable_name}'. Output:\n{basic_info}"
-
-        type_command = f"p type({variable_name})"
-        print(f"Sending command: {type_command}")
-        type_info = send_to_pdb(type_command)
-        if not pdb_running and "Session ended" not in basic_info:
-            return f"Value:\n{basic_info}\n\nSession ended after 'p type({variable_name})'. Type Output:\n{type_info}"
-
-        dir_command = f"import inspect; print(dir({variable_name}))"
-        print("Sending command: (inspect dir)")
-        dir_info = send_to_pdb(dir_command)
-        if not pdb_running and "Session ended" not in type_info:
-            return f"Value:\n{basic_info}\n\nType:\n{type_info}\n\nSession ended after 'dir()'. Dir Output:\n{dir_info}"
-
-        pp_command = f"pp {variable_name}"
-        print(f"Sending command: {pp_command}")
-        pretty_info = send_to_pdb(pp_command)
-        if not pdb_running and "Session ended" not in dir_info:
-            return f"Value:\n{basic_info}\n\nType:\n{type_info}\n\nAttributes/Methods:\n{dir_info}\n\nSession ended after 'pp'. PP Output:\n{pretty_info}"
-
-        return (f"--- Variable Examination: {variable_name} ---\n\n"
-                f"Value (p):\n{basic_info}\n\n"
-                f"Pretty Value (pp):\n{pretty_info}\n\n"
-                f"Type (p type()):\n{type_info}\n\n"
-                f"Attributes/Methods (dir()):\n{dir_info}\n"
-                f"--- End Examination ---")
-
-    # Caveman path: compact value + type, optional attrs on request
-    basic_info = send_to_pdb(f"p {variable_name}")
-    if not pdb_running:
-        return f"Session ended. Output:\n{basic_info}"
-
-    type_info = send_to_pdb(f"p type({variable_name})")
-    if not pdb_running:
-        return f"Value: {basic_info}\nSession ended during type query."
-
-    result = f"Value: {basic_info}\nType:  {type_info}"
-
-    if include_attrs and pdb_running:
-        dir_info = send_to_pdb(f"import inspect; print(dir({variable_name}))")
-        result += f"\nAttrs: {dir_info}"
-
-    return result
+    )
+    if caveman_mode:
+        return response
+    return f"--- Variable Examination: {expr} ---\n{response}"
 
 
 @mcp.tool()
 def get_debug_status() -> str:
     """Get the current status of the debugging session and tracked state."""
-    global pdb_running, current_file, current_project_root, breakpoints, pdb_process
-    global remote_mode, remote_host, remote_port, remote_socket
-
+    global pdb_running
+    if pdb_running and not _session_alive():
+        pdb_running = False
+        return "Debugging session has ended " + (
+            "(remote connection closed)." if remote_mode else "(process terminated)."
+        )
     if not pdb_running:
-         if remote_mode and remote_socket is None:
-             return "Remote debugging connection closed."
-         if pdb_process and pdb_process.poll() is not None:
-             return "Debugging session ended. Process terminated."
-         return "No active debugging session."
+        return "No active debugging session."
 
-    # Check connection liveness
+    tracked = _format_tracked_breakpoints() or "None"
     if remote_mode:
-        if not _is_remote_connected():
-            pdb_running = False
-            return "Remote debugging connection has been closed."
-    else:
-        if pdb_process and pdb_process.poll() is not None:
-            pdb_running = False
-            return "Debugging session has ended (process terminated)."
-
-    # Format tracked breakpoints for status
-    bp_list = []
-    for abs_path, lines in breakpoints.items():
-         try:
-             rel_path = os.path.relpath(abs_path, current_project_root or os.getcwd())
-             if rel_path == '.': rel_path = os.path.basename(abs_path)
-         except ValueError:
-             rel_path = abs_path
-         for line_num in sorted(lines.keys()):
-            bp_data = lines[line_num]
-            if isinstance(bp_data, dict) and "bp_number" in bp_data:
-                bp_list.append(f"{rel_path}:{line_num} (BP #{bp_data['bp_number']})")
-            else:
-                bp_list.append(f"{rel_path}:{line_num}")
-
-    if remote_mode:
-        status_lines = [
+        lines = [
             "--- Debug Session Status ---",
-            f"Running: {pdb_running}",
-            f"Mode: remote",
+            "Mode: remote",
             f"Remote host: {remote_host}:{remote_port}",
-            f"Project Root: {current_project_root or '(not set)'}",
-            f"Tracked Breakpoints: {bp_list or 'None'}",
         ]
     else:
-        status_lines = [
+        assert pdb_process is not None
+        lines = [
             "--- Debug Session Status ---",
-            f"Running: {pdb_running}",
-            f"Mode: local",
-            f"PID: {pdb_process.pid if pdb_process else None}",
+            "Mode: local",
+            f"PID: {pdb_process.pid}",
             f"Project Root: {current_project_root}",
             f"Debugging File: {current_file}",
             f"Using Pytest: {current_use_pytest}",
-            f"Arguments: '{current_args}'",
-            f"Tracked Breakpoints: {bp_list or 'None'}",
+            f"Arguments: {current_args!r}",
         ]
+    lines += [f"Caveman mode: {caveman_mode}", f"Tracked Breakpoints: {tracked}", ""]
 
-    # caveman_mode: compact 'w' (stack trace); verbose: full 'l .' source window
-    loc_cmd = "l ." if not caveman_mode else "w"
-    loc_label = "-- Current location --" if not caveman_mode else "-- Stack (w) --"
-    current_loc_output = "[Could not query PDB location]"
-    still_active = _is_remote_connected() if remote_mode else _is_local_process_alive()
-    if pdb_running and still_active:
-        current_loc_output = send_to_pdb(loc_cmd)
-        if not pdb_running:
-            current_loc_output += "\n -- Session ended during status check --"
-
-    status_lines.append("")
-    status_lines.append(loc_label)
-    status_lines.append(current_loc_output)
-    status_lines.append("--- End Status ---")
-    return '\n'.join(status_lines)
+    if not at_prompt:
+        # Sending a command now would be read by the program, not pdb.
+        lines.append("-- Program is running (not at a (Pdb) prompt). Use get_output or interrupt. --")
+    elif caveman_mode:
+        lines += ["-- Stack (w) --", send_to_pdb("w")]
+    else:
+        lines += ["-- Current location --", send_to_pdb("l .")]
+    lines.append("--- End Status ---")
+    return "\n".join(lines)
 
 
 @mcp.tool()
 def end_debug() -> str:
-    """End the current debugging session forcefully.
+    """End the current debugging session (local process or remote connection)."""
+    global pdb_process, pdb_running, output_thread, at_prompt
 
-    Works for both local subprocess sessions and remote TCP sessions.
-    """
-    global pdb_process, pdb_running, output_thread
-
-    nothing_to_end = (
-        not pdb_running
-        and (pdb_process is None or pdb_process.poll() is not None)
-        and remote_socket is None
-    )
-    if nothing_to_end:
+    if not pdb_running and pdb_process is None and remote_socket is None:
         return "No active debugging session to end."
 
-    print("Ending debugging session...")
     result_message = "Debugging session ended."
-
-    if remote_mode:
-        # --- Remote session teardown ---
-        print(f"Closing remote PDB connection to {remote_host}:{remote_port}...")
-        if remote_socket:
-            try:
-                # Politely ask PDB to quit before closing
-                try:
-                    remote_socket.sendall(b'q\n')
-                    time.sleep(0.2)
-                except Exception:
-                    pass
-                # shutdown() before close() so a reader thread blocked in
-                # recv()/select() unblocks immediately on every POSIX impl.
-                try:
-                    remote_socket.shutdown(socket_module.SHUT_RDWR)
-                except OSError:
-                    pass
-                remote_socket.close()
-                print("Remote socket closed.")
-            except Exception as e:
-                print(f"Error closing remote socket: {e}", file=sys.stderr)
-                result_message = f"Remote session ended with socket error: {e}"
+    if remote_mode or remote_socket is not None:
+        if remote_socket is not None:
+            with contextlib.suppress(OSError):
+                remote_socket.sendall(b"q\n")  # politely ask pdb to quit
+                time.sleep(0.2)
+            _close_socket(remote_socket)
         _clear_remote_state()
-
-    elif pdb_process and pdb_process.poll() is None:
-        # --- Local process teardown ---
-        try:
-            # Try sending SIGINT (Ctrl+C) first for cleaner exit
-            if sys.platform != "win32":
+    elif pdb_process is not None:
+        proc = pdb_process
+        if proc.poll() is None:
+            # 1. Ask pdb to quit and close stdin (EOF also makes pdb exit).
+            with contextlib.suppress(OSError, ValueError):
+                if proc.stdin is not None:
+                    proc.stdin.write(b"q\n")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                # 2. SIGTERM, then 3. SIGKILL the whole process group.
+                _signal_group(proc, signal.SIGTERM)
                 try:
-                    os.kill(pdb_process.pid, signal.SIGINT)
-                    try:
-                        pdb_process.wait(timeout=0.5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                except (OSError, ProcessLookupError) as e:
-                    print(f"SIGINT failed: {e}")
-
-            # Next try sending quit command for graceful exit
-            if pdb_process.poll() is None:
-                try:
-                    print("Attempting graceful exit with 'q'...")
-                    if pdb_process.stdin is not None:
-                        pdb_process.stdin.write(b'q\n')
-                        pdb_process.stdin.flush()
-                    # Wait briefly for potential cleanup
-                    pdb_process.wait(timeout=0.5)
-                    print("PDB process quit gracefully.")
-                except (subprocess.TimeoutExpired, OSError, BrokenPipeError) as e:
-                    print(f"Graceful quit failed or timed out ({e}). Terminating forcefully.")
-
-            # If still running, terminate forcefully
-            if pdb_process.poll() is None:
-                try:
-                    pdb_process.terminate() # Send SIGTERM
-                    pdb_process.wait(timeout=1.0) # Wait for termination
-                    print("PDB process terminated.")
+                    proc.wait(timeout=2.0)
                 except subprocess.TimeoutExpired:
-                    print("Terminate timed out. Killing process.")
-                    pdb_process.kill() # Send SIGKILL
-                    pdb_process.wait(timeout=0.5) # Wait for kill
-                    print("PDB process killed.")
-                except Exception as term_err:
-                     print(f"Error during terminate/kill: {term_err}", file=sys.stderr)
-                     result_message = f"Debugging session ended with errors during termination: {term_err}"
-        except Exception as e:
-            print(f"Error during end_debug: {e}", file=sys.stderr)
-            result_message = f"Debugging session ended with errors: {e}"
+                    _signal_group(proc, signal.SIGKILL)
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        result_message = f"Warning: PDB process {proc.pid} did not exit after SIGKILL."
+        # Reap any grandchildren left behind (e.g. python under `uv run`).
+        if sys.platform != "win32":
+            _signal_group(proc, signal.SIGKILL)
 
-    # Clean up shared state.  Also reset caveman_mode so a subsequent
-    # start_debug / connect_remote_debug call without the parameter does
-    # not silently inherit the previous session's output mode.
     pdb_process = None
     pdb_running = False
-    globals()['caveman_mode'] = False
+    at_prompt = False
+    _set_caveman(False)  # don't leak into a later session started without it
 
-    # Wait briefly for the output thread to potentially finish reading remaining output
-    if output_thread and output_thread.is_alive():
-         print("Waiting for output thread to finish...")
-         output_thread.join(timeout=0.5)
-         if output_thread.is_alive():
-              print("Warning: Output thread did not finish cleanly.", file=sys.stderr)
-
-    output_thread = None # Clear thread object reference
-
-    # Clear the queue one last time
-    while not pdb_output_queue.empty():
-        try: pdb_output_queue.get_nowait()
-        except queue.Empty: break
-
-    print("Debugging session ended and state cleared.")
+    if output_thread is not None and output_thread.is_alive():
+        output_thread.join(timeout=1.0)
+        if output_thread.is_alive():
+            log.warning("Output reader thread did not finish cleanly.")
+    output_thread = None
+    _drain_queue()
     return result_message
 
-# --- Cleanup on Exit ---
 
-def cleanup():
-    """Ensure the PDB process / remote socket is closed when the MCP server exits."""
-    if pdb_running or (pdb_process and pdb_process.poll() is None) or remote_socket is not None:
-        print("Running atexit cleanup...")
+# --- Cleanup on exit --------------------------------------------------------
+
+
+def cleanup() -> None:
+    """Make sure the debuggee / socket does not outlive the server."""
+    if pdb_running or pdb_process is not None or remote_socket is not None:
         end_debug()
+
 
 atexit.register(cleanup)
 
-# --- Main Execution ---
 
-def main():
-    """Initialize and run the FastMCP server."""
-    print("--- Starting MCP PDB Tool Server ---")
-    print(f"Python Executable: {sys.executable}")
-    print(f"Working Directory: {os.getcwd()}")
-    # Add any other relevant startup info here
+def main() -> None:
+    """Run the MCP server over stdio."""
+    logging.basicConfig(
+        stream=sys.stderr,
+        level=os.environ.get("MCP_PDB_LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log.info("Starting mcp-pdb (python=%s, cwd=%s)", sys.executable, os.getcwd())
     mcp.run()
-    print("--- MCP PDB Tool Server Shutdown ---")
+
 
 if __name__ == "__main__":
     main()
