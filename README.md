@@ -45,16 +45,33 @@ claude mcp add mcp-pdb -- uv run --python 3.13 --with mcp-pdb mcp-pdb
 
 | Tool | Description |
 |------|-------------|
-| `start_debug(file_path, use_pytest, args)` | Start a local debugging session for a Python file |
-| `connect_remote_debug(host, port, timeout)` | Connect to a remote PDB session over TCP |
-| `send_pdb_command(command)` | Send a command to the running PDB instance (local or remote) |
-| `set_breakpoint(file_path, line_number)` | Set a breakpoint at a specific line |
-| `clear_breakpoint(file_path, line_number)` | Clear a breakpoint at a specific line |
-| `list_breakpoints()` | List all current breakpoints |
-| `restart_debug()` | Restart/reconnect the current debugging session |
-| `examine_variable(variable_name)` | Get detailed information about a variable |
+| `start_debug(file_path, use_pytest, args, caveman_mode)` | Start a local debugging session for a Python file |
+| `connect_remote_debug(host, port, timeout, caveman_mode)` | Connect to a remote PDB session over TCP |
+| `send_pdb_command(command, timeout)` | Send a command to the running PDB instance (local or remote) |
+| `get_output(timeout)` | Wait for more output without sending a command (e.g. after a long `c`) |
+| `interrupt()` | Pause a running local program, like Ctrl+C |
+| `set_breakpoint(file_path, line_number, condition)` | Set a (optionally conditional) breakpoint |
+| `clear_breakpoint(file_path, line_number)` | Clear the breakpoint(s) at a line |
+| `list_breakpoints()` | List breakpoints in PDB and those tracked for restarts |
+| `restart_debug()` | Restart/reconnect, restoring breakpoints and `caveman_mode` |
+| `examine_variable(variable_name, include_attrs, max_chars)` | Type, length, value and attributes of an expression in one round-trip |
 | `get_debug_status()` | Show the current state of the debugging session |
-| `end_debug()` | End the current debugging session (closes socket for remote) |
+| `end_debug()` | End the session (kills the debuggee's whole process group; closes the socket for remote) |
+
+### How waiting works
+
+Every command returns as soon as pdb prints its `(Pdb)` prompt, so ordinary
+commands come back in milliseconds.  The `timeout` is only a ceiling (30 s for
+commands that run code such as `c`/`r`/`unt`, 10 s otherwise).  If the program
+is still running when it expires, you get the partial output plus a note; call
+`get_output` to keep waiting or `interrupt` to pause it.  Output that arrives
+between calls is never dropped — it is returned with the next response.
+
+Breakpoints set with `set_breakpoint` *or* raw `b ...` commands are tracked
+per project and restored (with their conditions) on `restart_debug` or the next
+`start_debug` in the same project.  Tool results are capped at ~20k characters.
+
+Set `MCP_PDB_LOG_LEVEL=DEBUG` for verbose server logs (written to stderr).
 
 ## Remote Debugging
 
@@ -179,9 +196,10 @@ socket gracefully (sends `q` first).
 
 - Project-aware debugging with automatic virtual environment detection
 - Support for both direct Python debugging and pytest-based debugging
-- Automatic breakpoint tracking and restoration between sessions
+- Automatic breakpoint tracking (including conditions and breakpoints in other files) and restoration between sessions
 - Works with UV package manager
-- Variable inspection with type information and attribute listing
+- Variable inspection with type information and attribute listing, without polluting the debugged frame
+- Prompt-driven I/O: no fixed sleeps, nothing lost on long-running commands
 
 ## Troubleshooting
 

@@ -13,7 +13,7 @@ This project is a debugging tool that integrates PDB (Python Debugger) with the 
 ### Package Management
 - This project uses `uv` for package management instead of pip/pip-tools
 - Commands should use the `uv run` prefix for running Python tools
-- Detection of uv environment is done via `uv tree` command
+- A project is treated as uv-managed when `uv` is on PATH and the project root has a `pyproject.toml`
 
 ### Debugging
 - When debugging with `uv`, use `uv run pdb <file_path>` instead of `python -m pdb`
@@ -30,5 +30,5 @@ This project is a debugging tool that integrates PDB (Python Debugger) with the 
 
 ### Development Notes
 - The project uses the FastMCP framework for building MCP tools
-- Detection of uv environments is done by running `uv tree` in the project directory
+- Never `print()` in `main.py`: stdout is the MCP JSON-RPC channel. Use `log` (stderr); a test enforces this
 - Breakpoints are tracked across debug sessions
